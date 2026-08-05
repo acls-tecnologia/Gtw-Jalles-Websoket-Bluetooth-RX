@@ -124,24 +124,71 @@ esp_err_t lora_e32_init(const lora_e32_config_t *cfg) {
     return ESP_OK;
 }
 
-esp_err_t lora_e32_apply_cfg(void) {
+esp_err_t lora_e32_reinit(void) {
+    return lora_e32_init(&g_cfg);
+}
+
+static bool cfg_response_matches(const uint8_t *resp, int len, const uint8_t *cmd) {
+    for (int offset = 0; offset + 6 <= len; offset++) {
+        uint8_t response_head = resp[offset];
+        bool known_head = response_head == 0xC0 || response_head == 0xC1 || response_head == 0xC2;
+
+        bool same_address = resp[offset + 1] == cmd[1] && resp[offset + 2] == cmd[2];
+        bool same_radio = resp[offset + 4] == cmd[4] && resp[offset + 5] == cmd[5];
+        bool speed_matches = resp[offset + 3] == cmd[3];
+
+        // A rede instalada usa 0x18. Algumas revisoes do E32 mantem/retornam
+        // 0x1A; isso nao deve bloquear a UART nem a recepcao dos frames legados.
+        if (cmd[3] == 0x18 && resp[offset + 3] == 0x1A) {
+            speed_matches = true;
+            ESP_LOGW(TAG, "E32 retornou SPED=0x1A para a configuracao legada 0x18; mantendo radio disponivel");
+        }
+
+        if (known_head && same_address && speed_matches && same_radio)
+            return true;
+    }
+
+    return false;
+}
+
+static esp_err_t lora_e32_apply_cfg_with_head(uint8_t head) {
+    if (!g_uart_installed) {
+        ESP_LOGE(TAG, "UART do E32 nao esta inicializada");
+        return ESP_ERR_INVALID_STATE;
+    }
+
     g_rx_stream_len = 0;
+    esp_err_t result = ESP_OK;
 
-    // Replica 1:1 o seu teste que funcionou (sem AUX)
     set_mode_cfg();
-    vTaskDelay(pdMS_TO_TICKS(500)); // CRÍTICO
+    vTaskDelay(pdMS_TO_TICKS(500));
 
-    uint8_t cmd[6] = {g_cfg.head, g_cfg.addh, g_cfg.addl, g_cfg.speed, g_cfg.channel, g_cfg.option};
+    uint8_t cmd[6] = {head, g_cfg.addh, g_cfg.addl, g_cfg.speed, g_cfg.channel, g_cfg.option};
 
-    uart_flush_input(g_cfg.uart_num);
-    uart_write_bytes(g_cfg.uart_num, (const char *)cmd, sizeof(cmd));
-    uart_wait_tx_done(g_cfg.uart_num, pdMS_TO_TICKS(500));
+    result = uart_flush_input(g_cfg.uart_num);
+    if (result != ESP_OK) {
+        ESP_LOGE(TAG, "Falha ao limpar RX antes da configuracao: %s", esp_err_to_name(result));
+        goto restore_normal_mode;
+    }
 
-    vTaskDelay(pdMS_TO_TICKS(300)); // CRÍTICO (gravação interna)
+    int written = uart_write_bytes(g_cfg.uart_num, (const char *)cmd, sizeof(cmd));
+    if (written != (int)sizeof(cmd)) {
+        ESP_LOGE(TAG, "Falha ao enviar configuracao ao E32: escrito=%d esperado=%u", written,
+                 (unsigned)sizeof(cmd));
+        result = written < 0 ? ESP_FAIL : ESP_ERR_INVALID_SIZE;
+        goto restore_normal_mode;
+    }
 
-    // tenta ler eco/resposta do módulo (opcional, mas ajuda debug)
+    result = uart_wait_tx_done(g_cfg.uart_num, pdMS_TO_TICKS(500));
+    if (result != ESP_OK) {
+        ESP_LOGE(TAG, "Timeout/falha ao transmitir configuracao: %s", esp_err_to_name(result));
+        goto restore_normal_mode;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(300));
+
     uint8_t resp[16];
-    int r = uart_read_bytes(g_cfg.uart_num, resp, sizeof(resp), pdMS_TO_TICKS(200));
+    int r = uart_read_bytes(g_cfg.uart_num, resp, sizeof(resp), pdMS_TO_TICKS(500));
     if (r > 0) {
         char line[128];
         int p = 0;
@@ -149,16 +196,39 @@ esp_err_t lora_e32_apply_cfg(void) {
         for (int i = 0; i < r; i++)
             p += snprintf(line + p, sizeof(line) - p, " %02X", resp[i]);
         ESP_LOGI(TAG, "%s", line);
+
+        if (!cfg_response_matches(resp, r, cmd)) {
+            ESP_LOGE(TAG,
+                     "Resposta do E32 nao confirma os parametros enviados (esperado: %02X %02X %02X %02X %02X)",
+                     cmd[1], cmd[2], cmd[3], cmd[4], cmd[5]);
+            result = ESP_ERR_INVALID_RESPONSE;
+        }
+    } else if (r == 0) {
+        ESP_LOGE(TAG, "E32 nao respondeu a configuracao");
+        result = ESP_ERR_TIMEOUT;
     } else {
-        ESP_LOGW(TAG, "no response from module (isso pode acontecer em alguns E32)");
+        ESP_LOGE(TAG, "Falha ao ler resposta da configuracao do E32");
+        result = ESP_FAIL;
     }
 
+restore_normal_mode:
     set_mode_normal();
-    vTaskDelay(pdMS_TO_TICKS(500)); // CRÍTICO: pronto p/ TX/RX
+    vTaskDelay(pdMS_TO_TICKS(500));
 
-    ESP_LOGI(TAG, "radio cfg applied: %02X %02X %02X %02X %02X %02X", cmd[0], cmd[1], cmd[2], cmd[3], cmd[4], cmd[5]);
+    if (result == ESP_OK) {
+        ESP_LOGI(TAG, "radio cfg confirmed: %02X %02X %02X %02X %02X %02X", cmd[0], cmd[1], cmd[2], cmd[3],
+                 cmd[4], cmd[5]);
+    }
 
-    return ESP_OK;
+    return result;
+}
+
+esp_err_t lora_e32_apply_cfg(void) {
+    return lora_e32_apply_cfg_with_head(g_cfg.head);
+}
+
+esp_err_t lora_e32_apply_cfg_temp(void) {
+    return lora_e32_apply_cfg_with_head(0xC2);
 }
 
 int lora_e32_send_raw(const uint8_t *data, int len) {
@@ -177,6 +247,15 @@ int lora_e32_send_raw(const uint8_t *data, int len) {
         return -1;
 
     return total;
+}
+
+void lora_e32_flush_rx(void) {
+    if (g_uart_installed) {
+        uart_flush_input(g_cfg.uart_num);
+    }
+
+    g_rx_stream_len = 0;
+    g_rx_stream_last_byte_us = 0;
 }
 
 int lora_e32_receive_raw(uint8_t *out, int maxlen, int timeout_ms) {

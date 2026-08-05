@@ -24,7 +24,10 @@ typedef struct {
 } lora_e32_config_t;
 
 esp_err_t lora_e32_init(const lora_e32_config_t *cfg);
+esp_err_t lora_e32_reinit(void);
 esp_err_t lora_e32_apply_cfg(void); // grava os 6 bytes no rádio (com delays)
+esp_err_t lora_e32_apply_cfg_temp(void);
 
 int lora_e32_send_raw(const uint8_t *data, int len);
 int lora_e32_receive_raw(uint8_t *out, int maxlen, int timeout_ms);
+void lora_e32_flush_rx(void);

@@ -1,11 +1,12 @@
 #include "config.h" //Configuração do projeto
 
-#define BLE_STARTUP_WINDOW_MS (60 * 1000U)
+#define BLE_STARTUP_WINDOW_MS (30 * 1000U)
 #define HTTP_MUTEX_WAIT_MS 20000U
 #if (GTW_ROLE_TX_ONLY == 0)
 #define PATCH_BACKOFF_MIN_MS 2000U
 #define PATCH_BACKOFF_MAX_MS 30000U
 #define PATCH_BACKOFF_JITTER_MS 1000U
+#define PATCH_MAX_ATTEMPTS 5U
 #endif
 #define GTW_RX_DUP_CACHE_SIZE 64
 #define GTW_TANK_SEEN_CACHE_SIZE 64
@@ -75,6 +76,7 @@ typedef struct {
 static SemaphoreHandle_t gtw_ack_mutex = NULL;
 #endif
 static SemaphoreHandle_t gtw_request_mutex = NULL;
+static volatile bool gtw_lora_ready = false;
 #if (GTW_ROLE_TX_ONLY == 0)
 static SemaphoreHandle_t patch_pool_mutex = NULL;
 static patch_slot_state_t patchPoolState[QUEUE_LENGTH] = {0};
@@ -87,8 +89,24 @@ static gtw_rx_dup_t gtw_rx_dup_cache[GTW_RX_DUP_CACHE_SIZE] = {0};
 #endif
 static gtw_tank_seen_t gtw_tank_seen_cache[GTW_TANK_SEEN_CACHE_SIZE] = {0};
 static const gtw_tank_name_t gtw_tank_names[] = {
+    {1, "R-0 Nivel 1"},
+    {21, "R-0 Nivel 2"},
+    {22, "R-01"},
+    {23, "R-02A"},
+    {24, "R-04"},
+    {29, "R-11"},
+    {41, "Captacao Revolta"},
+    {61, "RA-09"},
+    {62, "RA-10"},
+    {63, "RD-0"},
+    {81, "RD-02"},
+    {82, "RD-06"},
+    {83, "RD-09"},
+    {84, "Booster"},
+    {25, "R-02"},
+    {26, "R-03"},
+    {27, "R-05"},
     {28, "ETAR"},
-    {9, "Captacao Revolta"},
 };
 static volatile int64_t gtw_last_lora_rx_ms = 0;
 static volatile bool ble_config_mode_active = false;
@@ -191,11 +209,12 @@ static bool gtw_expand_compact_alert_body(const char *body, uint16_t tank_id, ch
         break;
     case 3:
         if (bomba_id > 0)
-            snprintf(mensagem, sizeof(mensagem), "ALERTA BOMBA: Tanque %s, Bomba %d, FALHA AO LIGAR BOMBA, emergencia global ativa",
-                     tanque_nome, bomba_id);
+            snprintf(mensagem, sizeof(mensagem),
+                     "ALERTA BOMBA: Tanque %s, Bomba %d, FALHA AO LIGAR BOMBA, emergencia global ativa", tanque_nome,
+                     bomba_id);
         else
-            snprintf(mensagem, sizeof(mensagem), "ALERTA BOMBA: Tanque %s, FALHA AO LIGAR BOMBA, emergencia global ativa",
-                     tanque_nome);
+            snprintf(mensagem, sizeof(mensagem),
+                     "ALERTA BOMBA: Tanque %s, FALHA AO LIGAR BOMBA, emergencia global ativa", tanque_nome);
         break;
     case 4:
         if (bomba_id > 0)
@@ -204,8 +223,7 @@ static bool gtw_expand_compact_alert_body(const char *body, uint16_t tank_id, ch
                      tanque_nome, bomba_id);
         else
             snprintf(mensagem, sizeof(mensagem),
-                     "ALERTA BOMBA: Tanque %s, FALHA AO LIGAR BOMBA, retorno real nao confirmou em 30s",
-                     tanque_nome);
+                     "ALERTA BOMBA: Tanque %s, FALHA AO LIGAR BOMBA, retorno real nao confirmou em 30s", tanque_nome);
         break;
     case 5:
         if (bomba_id > 0)
@@ -302,7 +320,7 @@ static void tentar_conectar_wifi(void);
 
 void login_task(void *pvParameters);
 
-void start_token_timer();
+static bool restart_token_timer(void);
 
 static void token_timer_cb(void *arg);
 
@@ -438,8 +456,10 @@ void app_main(void) {
      * 3️⃣ Mutex
      ****************************************/
     MutexHTTP = xSemaphoreCreateMutex();
-    if (!MutexHTTP)
+    if (!MutexHTTP) {
         ESP_LOGE(TAG, "Falha ao criar MutexHTTP");
+        ConnectRest();
+    }
 
     MutexLora = xSemaphoreCreateMutex();
     if (!MutexLora) {
@@ -508,7 +528,7 @@ void app_main(void) {
                userNameHTTPs[0] == '\0' || passwordHTTPs[0] == '\0') {
 
             if (initBT == 0) {
-                bluetooth_config_start(0);
+                bluetooth_config_start(BLUETOOTH_CONFIG_TIMEOUT_FOREVER_MS);
                 printf("Bluetooth iniciado para configuração.\n");
             }
 
@@ -540,10 +560,10 @@ void app_main(void) {
         }
     }
 
-    if (nvs_resgatar_float(NVS_KEY_Fversion) > 0) // Verifica se há algum valor de firmware dentro do NVS
+    float saved_firmware_version = nvs_resgatar_float(NVS_KEY_Fversion);
+    if (saved_firmware_version > 0)
     {
-        Firmware_version =
-            nvs_resgatar_float(NVS_KEY_Fversion); // Se houver, salva o valor na variavel "Firmware_version"
+        Firmware_version = saved_firmware_version;
         ESP_LOGI("NVS", ">>>>>>>>>>>>>>>>>>>>>> Firmware_version : %f", Firmware_version);
     }
 
@@ -558,8 +578,22 @@ void app_main(void) {
      ****************************************/
     ESP_LOGI(TAG, "Criando tasks...");
 
-    if (xTaskCreate(wifi_task, "Conecta_Wifi", 4096, NULL, 5, &taskConecta_WIFI) != pdPASS)
+    ESP_LOGI(TAG, "BLE aberto no boot por 30 segundos; Wi-Fi inicia somente depois da janela BLE");
+    ble_startup_window_active = true;
+    esp_err_t ble_start_err = bluetooth_config_start(BLE_STARTUP_WINDOW_MS);
+    if (ble_start_err != ESP_OK) {
+        ble_startup_window_active = false;
+        ESP_LOGE(TAG, "Falha ao abrir BLE no boot: %s", esp_err_to_name(ble_start_err));
+    } else if (xTaskCreate(ble_startup_window_task, "ble_boot_wait", 3072, NULL, 4, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Falha ao criar task da janela BLE; fechando BLE para liberar o Wi-Fi");
+        bluetooth_config_stop();
+        ble_startup_window_active = false;
+    }
+
+    if (xTaskCreate(wifi_task, "Conecta_Wifi", 4096, NULL, 5, &taskConecta_WIFI) != pdPASS) {
         ESP_LOGE(TAG, "Falha ao criar task WiFi");
+        ConnectRest();
+    }
 
     if (xTaskCreate(gtw_lora_rx_task, "gtw_lora_rx_task", 4096, NULL, 5, NULL) != pdPASS) {
         ESP_LOGE(TAG, "Falha ao criar task LoRa RX");
@@ -586,10 +620,6 @@ void app_main(void) {
      ****************************************/
     ESP_LOGI(TAG, "Sistema inicializado com sucesso.");
 
-    ESP_LOGI(TAG, "BLE aberto no boot por 1 minuto; Wi-Fi inicia depois da janela BLE");
-    ble_startup_window_active = true;
-    bluetooth_config_start(BLE_STARTUP_WINDOW_MS);
-    xTaskCreate(ble_startup_window_task, "ble_boot_wait", 3072, NULL, 4, NULL);
 }
 
 static void tentar_conectar_wifi(void) {
@@ -598,7 +628,10 @@ static void tentar_conectar_wifi(void) {
         return;
     }
 
-    wifi_start_driver();
+    if (!wifi_start_driver()) {
+        ESP_LOGE(TAG, "Falha ao iniciar driver Wi-Fi");
+        return;
+    }
 
     if (usando_secundario && wifi_secundario) {
         ESP_LOGI(TAG, "Conectando ao Wi-Fi SECUNDÁRIO (%s)", WIFI_SECONDARY_SSID);
@@ -615,13 +648,15 @@ void wifi_task(void *pv) {
     tentar_conectar_wifi();
 
     static int falhas_wifi = 0;
+    static int falhas_ip = 0;
     static int falhas_internet = 0;
     static int ciclos_religar = 0;
+    int64_t inicio_falha_internet_ms = 0;
     int wifi_4G = 0;
 
     while (1) {
         esp_task_wdt_reset();
-        vTaskDelay(pdMS_TO_TICKS(10000)); // verificação a cada 10s
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(WIFI_MONITOR_INTERVAL_MS));
 
         if (ble_config_mode_active || ble_startup_window_active) {
             if (wifi_is_active()) {
@@ -629,31 +664,75 @@ void wifi_task(void *pv) {
                 wifi_stop_driver();
             }
             Connectado = 0;
-            TokenOk = 0;
             continue;
         }
 
         if (!wifi_is_active()) {
             ESP_LOGW(TAG, "Driver Wi-Fi inativo — reiniciando driver...");
             tentar_conectar_wifi();
-            falhas_wifi = 0;
+
+            if (!wifi_is_active()) {
+                ciclos_religar++;
+                ESP_LOGE(TAG, "Driver Wi-Fi nao iniciou (%d/%d)", ciclos_religar, WIFI_CYCLE_MAX_RETRIES);
+                if (ciclos_religar >= WIFI_CYCLE_MAX_RETRIES) {
+                    ESP_LOGE(TAG, "Driver Wi-Fi permaneceu inativo; reiniciando ESP32");
+                    esp_restart();
+                }
+            } else {
+                falhas_wifi = 0;
+            }
             continue;
         }
 
         // === Está conectado ao AP? ===
         if (wifi_sta_connected()) {
+            falhas_wifi = 0;
+
+            if (!wifi_sta_has_ip()) {
+                Connectado = 0;
+                falhas_internet = 0;
+                inicio_falha_internet_ms = 0;
+                falhas_ip++;
+                ESP_LOGW(TAG, "Associado ao roteador, mas sem IP (%d/%d)", falhas_ip, WIFI_IP_MAX_FAILS);
+
+                if (falhas_ip >= WIFI_IP_MAX_FAILS) {
+                    ESP_LOGW(TAG, "Sem IP por 60 segundos; reiniciando driver Wi-Fi");
+                    wifi_stop_driver();
+                    vTaskDelay(pdMS_TO_TICKS(WIFI_DRIVER_RESTART_DELAY_MS));
+
+                    if (wifi_secundario)
+                        usando_secundario = !usando_secundario;
+
+                    tentar_conectar_wifi();
+                    falhas_ip = 0;
+                    ciclos_religar++;
+                    if (ciclos_religar >= WIFI_CYCLE_MAX_RETRIES) {
+                        ESP_LOGE(TAG, "Sem IP apos %d ciclos; reiniciando ESP32", ciclos_religar);
+                        esp_restart();
+                    }
+                }
+                continue;
+            }
+
+            falhas_ip = 0;
+            ciclos_religar = 0;
+
             if (wifi_check_internet(INTERNET_CHECK_TIMEOUT_MS)) {
                 falhas_internet = 0;
-                falhas_wifi = 0;
-                ciclos_religar = 0;
+                inicio_falha_internet_ms = 0;
+#if DEBUG_MODE
                 ESP_LOGI(TAG, "Conectado e com internet!");
+#endif
 
                 if (Connectado == 0) {
                     Connectado = 1;
 
                     if (Task_login_task == NULL) {
-                        xTaskCreate(login_task, "login_task", 1024 * 8, NULL, 5, &Task_login_task);
-                        start_token_timer();
+                        if (xTaskCreate(login_task, "login_task", 1024 * 8, NULL, 5, &Task_login_task) != pdPASS) {
+                            Task_login_task = NULL;
+                            Connectado = 0;
+                            ESP_LOGE(TAG, "Falha ao criar login_task; nova tentativa no proximo ciclo");
+                        }
                     }
                 }
 
@@ -665,15 +744,21 @@ void wifi_task(void *pv) {
             } else {
                 Connectado = 0;
                 falhas_internet++;
-                ESP_LOGW(TAG, "Wi-Fi associado, mas backend indisponivel (%d/%d)", falhas_internet,
-                         WIFI_INTERNET_MAX_FAILS);
+                int64_t agora_ms = esp_timer_get_time() / 1000;
+                if (inicio_falha_internet_ms == 0)
+                    inicio_falha_internet_ms = agora_ms;
 
-                if (falhas_internet >= WIFI_INTERNET_MAX_FAILS) {
+                uint32_t sem_internet_ms = (uint32_t)(agora_ms - inicio_falha_internet_ms);
+                ESP_LOGW(TAG, "Wi-Fi associado, mas sem internet ha %lu s (falha %d)",
+                         (unsigned long)(sem_internet_ms / 1000U), falhas_internet);
+
+                if (sem_internet_ms >= WIFI_INTERNET_RESTART_DELAY_MS) {
+                    ESP_LOGW(TAG, "Sem internet por 30 minutos; reiniciando somente o driver Wi-Fi");
                     falhas_internet = 0;
-                    ciclos_religar++;
+                    inicio_falha_internet_ms = 0;
 
                     wifi_stop_driver();
-                    vTaskDelay(pdMS_TO_TICKS(WIFI_OFF_DELAY_MS));
+                    vTaskDelay(pdMS_TO_TICKS(WIFI_DRIVER_RESTART_DELAY_MS));
 
                     if (wifi_secundario) {
                         usando_secundario = !usando_secundario;
@@ -688,15 +773,23 @@ void wifi_task(void *pv) {
         } else {
             // Não conectado ao AP
             Connectado = 0;
+            falhas_ip = 0;
+            falhas_internet = 0;
+            inicio_falha_internet_ms = 0;
             falhas_wifi++;
             ESP_LOGW(TAG, "Wi-Fi desconectado (%d/%d)", falhas_wifi, WIFI_CONNECT_MAX_FAILS);
+
+            if (falhas_wifi < WIFI_CONNECT_MAX_FAILS) {
+                tentar_conectar_wifi();
+                continue;
+            }
 
             if (falhas_wifi >= WIFI_CONNECT_MAX_FAILS) {
                 ESP_LOGE(TAG, "Falhou reconexão Wi-Fi — reiniciando ciclo");
 
                 wifi_stop_driver();
 
-                vTaskDelay(pdMS_TO_TICKS(WIFI_OFF_DELAY_MS));
+                vTaskDelay(pdMS_TO_TICKS(WIFI_DRIVER_RESTART_DELAY_MS));
 
                 if (wifi_secundario)
                     usando_secundario = !usando_secundario;
@@ -721,14 +814,34 @@ static void token_timer_cb(void *arg) {
         xTaskNotify(Task_login_task, 1, eSetValueWithOverwrite);
 }
 
-// Função que cria o timer (chame uma vez na init, antes de rodar as tasks)
-void start_token_timer() {
-    const esp_timer_create_args_t timer_args = {
-        .callback = &token_timer_cb, .arg = NULL, .dispatch_method = ESP_TIMER_TASK, .name = "token_timer"};
-    esp_timer_create(&timer_args, &token_timer);
-    // 20h em microssegundos = 72.000.000.000
-    esp_timer_start_periodic(token_timer, 20ULL * 3600ULL * 1000000ULL);
-    // esp_timer_start_periodic(token_timer, 120ULL * 1000000ULL);
+static bool restart_token_timer(void) {
+    if (token_timer == NULL) {
+        const esp_timer_create_args_t timer_args = {
+            .callback = &token_timer_cb, .arg = NULL, .dispatch_method = ESP_TIMER_TASK, .name = "token_timer"};
+        esp_err_t create_err = esp_timer_create(&timer_args, &token_timer);
+        if (create_err != ESP_OK) {
+            ESP_LOGE(TAG, "Falha ao criar timer do token: %s", esp_err_to_name(create_err));
+            token_timer = NULL;
+            return false;
+        }
+    }
+
+    if (esp_timer_is_active(token_timer)) {
+        esp_err_t stop_err = esp_timer_stop(token_timer);
+        if (stop_err != ESP_OK) {
+            ESP_LOGE(TAG, "Falha ao parar timer anterior do token: %s", esp_err_to_name(stop_err));
+            return false;
+        }
+    }
+
+    esp_err_t start_err = esp_timer_start_once(token_timer, 20ULL * 3600ULL * 1000000ULL);
+    if (start_err != ESP_OK) {
+        ESP_LOGE(TAG, "Falha ao iniciar timer de renovacao do token: %s", esp_err_to_name(start_err));
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Renovacao do token agendada para daqui a 20 horas");
+    return true;
 }
 
 void login_task(void *pvParameters) {
@@ -736,14 +849,14 @@ void login_task(void *pvParameters) {
     Task_login_task = xTaskGetCurrentTaskHandle(); // salva o handle
 
     int taskInit = 0;
-    char mensagemRST[100];
-
     while (1) {
+#if DEBUG_MODE
         UBaseType_t stack_remain = uxTaskGetStackHighWaterMark(NULL);
         ESP_LOGI("STACK", "\033[1;35m*** Task [%s] - mínimo livre: %u words (~%u bytes) ***\033[0m",
                  pcTaskGetName(NULL), stack_remain, stack_remain * sizeof(StackType_t));
+#endif
 
-        TokenOk = 0;
+        TokenOk = token_global[0] != '\0';
 
         if (verifica_conexao_internet()) {
             if (Connectado == 0) {
@@ -766,7 +879,6 @@ void login_task(void *pvParameters) {
                 TokenOk = 1;
 
                 if (taskInit == 0) {
-                    esp_reset_reason_t reset_reason = esp_reset_reason();
                     taskInit = 1;
                     // atualizacao_OTA();
 
@@ -799,7 +911,7 @@ void login_task(void *pvParameters) {
 #endif
 
 #if (GTW_ROLE_TX_ONLY == 0)
-                if (task_patch == NULL) {
+                while (task_patch == NULL) {
 #if (GTW_ROLE_RX_ONLY == 0)
                     for (int i = 0; i < 80 && taskConnect_to_websocket != NULL; i++) {
                         if (ws_client != NULL && esp_websocket_client_is_connected(ws_client)) {
@@ -809,19 +921,28 @@ void login_task(void *pvParameters) {
                     }
 
 #endif
-                    xTaskCreate(patch_task, "patch_task", 1024 * 8, NULL, 5, &task_patch);
+                    if (xTaskCreate(patch_task, "patch_task", 1024 * 8, NULL, 5, &task_patch) != pdPASS) {
+                        task_patch = NULL;
+                        ESP_LOGE(TAG, "Falha ao criar patch_task; tentando novamente em 5s");
+                        vTaskDelay(pdMS_TO_TICKS(5000));
+                    }
                 }
 #else
                 ESP_LOGI(TAG, "Modo TX_ONLY: patch_task desativada");
 #endif
+
+                while (!restart_token_timer()) {
+                    ESP_LOGW(TAG, "Timer do token indisponivel; nova tentativa em 5s");
+                    vTaskDelay(pdMS_TO_TICKS(5000));
+                }
 
                 uint32_t notified;
                 xTaskNotifyWait(0, UINT32_MAX, &notified, portMAX_DELAY);
                 ESP_LOGI(TAG, "20h passaram → renovando token...");
                 continue;
             } else {
-                ESP_LOGW(TAG, "Login falhou, tentando novamente em 30s.");
-                vTaskDelay(pdMS_TO_TICKS(30000)); // 30s
+                ESP_LOGW(TAG, "Login falhou, tentando novamente em 5s.");
+                vTaskDelay(pdMS_TO_TICKS(5000)); // 5s
             }
         } else {
             ESP_LOGI(TAG, "Aguardando Wi-Fi e internet...");
@@ -1273,8 +1394,7 @@ static bool coalesce_queued_tank_level_patch(const char *path, const char *body,
     for (int i = 0; i < QUEUE_LENGTH; i++) {
         PatchRequest *request = &patchPool[i];
 
-        if (patchPoolState[i] == PATCH_SLOT_QUEUED && request->method == method &&
-            strcmp(request->path, path) == 0) {
+        if (patchPoolState[i] == PATCH_SLOT_QUEUED && request->method == method && strcmp(request->path, path) == 0) {
             strncpy(request->body, body, BODY_SIZE - 1);
             request->body[BODY_SIZE - 1] = '\0';
             xSemaphoreGive(patch_pool_mutex);
@@ -1320,8 +1440,8 @@ static bool queue_http_request(const char *path, const char *body, http_method_t
             if (coalesce_queued_tank_level_patch(path, body, method)) {
                 return true;
             }
-            ESP_LOGW("HTTP_QUEUE", "Fila cheia; nivel de %s confirmado sem enfileirar para evitar avalanche LoRa", path);
-            return true;
+            ESP_LOGW("HTTP_QUEUE", "Fila cheia; nivel de %s nao enfileirado e sem ACK", path);
+            return false;
         }
 
         ESP_LOGW("HTTP_QUEUE", "Fila cheia, mensagem LoRa nao confirmada");
@@ -1369,13 +1489,14 @@ static bool patch_status_is_permanent_client_error(int status) {
 void patch_task(void *pvParameters) {
     PatchRequest *request;
     uint32_t mutex_fail_count = 0;
-    uint32_t http_fail_total = 0;
 
     while (1) {
         if (xQueueReceive(xPatchQueue, &request, portMAX_DELAY) == pdTRUE) {
             uint8_t idx = (uint8_t)(request - patchPool);
             int status = -1;
             bool drop_request = false;
+            bool requeue_request = false;
+            uint32_t request_attempts = 0;
             patch_slot_set(idx, PATCH_SLOT_PROCESSING);
 
             while (!drop_request && (status < 200 || status >= 300)) {
@@ -1389,25 +1510,31 @@ void patch_task(void *pvParameters) {
 
                 if (xSemaphoreTake(MutexHTTP, pdMS_TO_TICKS(12000)) == pdTRUE) {
                     mutex_fail_count = 0;
+                    request_attempts++;
                     status = server_request(request->path, request->body, request->method);
                     xSemaphoreGive(MutexHTTP);
 
                     if (status >= 200 && status < 300) {
-                        http_fail_total = 0;
                         break;
                     }
 
                     if (patch_status_is_permanent_client_error(status)) {
-                        ESP_LOGE("PATCH_TASK",
-                                 "Descartando requisicao %s: erro HTTP permanente status=%d body=%s",
+                        ESP_LOGE("PATCH_TASK", "Descartando requisicao %s: erro HTTP permanente status=%d body=%s",
                                  request->path, status, request->body);
                         drop_request = true;
-                        http_fail_total = 0;
                         break;
                     }
 
-                    http_fail_total++;
-                    ESP_LOGW("PATCH_TASK", "Falha HTTP (%d), status=%d", http_fail_total, status);
+                    ESP_LOGW("PATCH_TASK", "Falha HTTP tentativa %u/%u, status=%d", (unsigned)request_attempts,
+                             (unsigned)PATCH_MAX_ATTEMPTS, status);
+
+                    if (request_attempts >= PATCH_MAX_ATTEMPTS) {
+                        ESP_LOGW("PATCH_TASK",
+                                 "Recolocando requisicao no fim da fila apos %u tentativas: status=%d path=%s",
+                                 (unsigned)request_attempts, status, request->path);
+                        requeue_request = true;
+                        break;
+                    }
 
 #if (GTW_ROLE_RX_ONLY == 0)
                     if (status == -1 && ws_client != NULL && esp_websocket_client_is_connected(ws_client)) {
@@ -1421,13 +1548,24 @@ void patch_task(void *pvParameters) {
                         ConnectRest();
                 }
 
-                uint32_t backoff_ms = patch_backoff_delay_ms(http_fail_total + mutex_fail_count);
+                uint32_t backoff_ms = patch_backoff_delay_ms(request_attempts + mutex_fail_count);
                 ESP_LOGW("PATCH_TASK", "Nova tentativa HTTP em %u ms", (unsigned)backoff_ms);
                 vTaskDelay(pdMS_TO_TICKS(backoff_ms));
             }
 
-            patch_slot_set(idx, PATCH_SLOT_FREE);
-            xQueueSend(xPatchFreeQueue, &idx, 0);
+            if (requeue_request) {
+                patch_slot_set(idx, PATCH_SLOT_QUEUED);
+
+                if (xQueueSend(xPatchQueue, &request, pdMS_TO_TICKS(500)) != pdPASS) {
+                    ESP_LOGE("PATCH_TASK", "Falha ao recolocar requisicao na fila; liberando slot path=%s",
+                             request->path);
+                    patch_slot_set(idx, PATCH_SLOT_FREE);
+                    xQueueSend(xPatchFreeQueue, &idx, 0);
+                }
+            } else {
+                patch_slot_set(idx, PATCH_SLOT_FREE);
+                xQueueSend(xPatchFreeQueue, &idx, 0);
+            }
         }
     }
 }
@@ -1437,6 +1575,8 @@ void patch_task(void *pvParameters) {
 /*############################################## Lora  ################################################*/
 
 static void lora_setup_gtw(void) {
+    msg_counter_gtw = (uint8_t)esp_random();
+
     lora_e32_config_t cfg = {
         .uart_num = UART_NUM_1,
         .tx_pin = 16,
@@ -1451,13 +1591,21 @@ static void lora_setup_gtw(void) {
         .head = 0xC0,
         .addh = 0x00,
         .addl = 0x01,
-        .speed = 0x18, // 9600 UART + menor air rate para alcance longo
+        .speed = 0x18, // configuracao legada usada pelos tanques instalados em campo
         .channel = 0x17,
         .option = 0x64,
     };
 
-    ESP_ERROR_CHECK(lora_e32_init(&cfg));
-    ESP_ERROR_CHECK(lora_e32_apply_cfg());
+    esp_err_t err = lora_e32_init(&cfg);
+    if (err == ESP_OK) {
+        err = lora_e32_apply_cfg();
+    }
+
+    gtw_lora_ready = (err == ESP_OK);
+    if (!gtw_lora_ready) {
+        ESP_LOGE("LORA_SETUP", "E32 indisponivel no boot: %s; recuperacao seguira em segundo plano",
+                 esp_err_to_name(err));
+    }
 }
 
 void gtw_lora_rx_task(void *pvParameters) {
@@ -1474,12 +1622,20 @@ void gtw_lora_rx_task(void *pvParameters) {
 
     while (1) {
         esp_task_wdt_reset();
+
+        if (!gtw_lora_ready) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
         int len = 0;
         memset(&rx, 0, sizeof(rx));
         int64_t now_ms = esp_timer_get_time() / 1000;
 
         if ((now_ms - last_stats_log_ms) >= 60000) {
+#if DEBUG_MODE
             gtw_lora_log_rx_stats(&stats, "periodico_60s");
+#endif
             last_stats_log_ms = now_ms;
         }
 
@@ -1489,6 +1645,10 @@ void gtw_lora_rx_task(void *pvParameters) {
         }
 
         if (len <= 0) {
+            if (len < 0) {
+                gtw_lora_ready = false;
+                ESP_LOGE("LORA_HEALTH", "Falha UART ao receber; E32 marcado para recuperacao");
+            }
             stats.timeout++;
             if ((stats.timeout % 500U) == 0U)
                 gtw_lora_log_rx_stats(&stats, "timeout_500");
@@ -1497,10 +1657,12 @@ void gtw_lora_rx_task(void *pvParameters) {
         }
 
         stats.frame_ok++;
+#if DEBUG_MODE
         ESP_LOGI(TAG,
                  "RX frame bruto ok #%lu bytes=%d src_type=%u src_id=%u dst_type=%u dst_id=%u type=%u msg_id=%u len=%u",
                  (unsigned long)stats.frame_ok, len, rx.src_type, rx.src_id, rx.dst_type, rx.dst_id, rx.msg_type,
                  rx.msg_id, rx.len);
+#endif
 
         size_t expected_air_len = lora_frame_air_len(&rx);
         if (expected_air_len == 0 || len != (int)expected_air_len) {
@@ -1510,7 +1672,9 @@ void gtw_lora_rx_task(void *pvParameters) {
             continue;
         }
 
+#if DEBUG_MODE
         ESP_LOGI(TAG, "RX src=%d id=%d type=%d msg=%.*s", rx.src_type, rx.src_id, rx.msg_type, rx.len, rx.payload);
+#endif
 
         if (rx.preamble != LORA_PREAMBLE) {
             stats.bad_preamble++;
@@ -1569,7 +1733,8 @@ void gtw_lora_rx_task(void *pvParameters) {
             TaskHandle_t waiter = NULL;
 
             xSemaphoreTake(gtw_ack_mutex, portMAX_DELAY);
-            if (gtw_ack_wait.active && gtw_ack_wait.msg_id == rx.msg_id && gtw_ack_wait.tank_id == rx.src_id) {
+            if (gtw_ack_wait.active && gtw_ack_wait.msg_id == rx.msg_id &&
+                gtw_ack_wait.tank_id == rx.src_id) {
                 waiter = gtw_ack_wait.waiter;
                 gtw_ack_wait.active = false;
                 gtw_ack_wait.accept_any_frame = false;
@@ -1602,7 +1767,9 @@ void gtw_lora_rx_task(void *pvParameters) {
             stats.ping_rx++;
             gtw_send_ack(&rx);
             stats.ack_sent++;
+#if DEBUG_MODE
             ESP_LOGI(TAG, "Heartbeat LoRa recebido do tanque %u", rx.src_id);
+#endif
             continue;
         }
 
@@ -1612,7 +1779,7 @@ void gtw_lora_rx_task(void *pvParameters) {
             gtw_rx_dup_t *dup = &gtw_rx_dup_cache[(rx.src_id ^ rx.msg_id) % GTW_RX_DUP_CACHE_SIZE];
 
             if (dup->used && dup->src_id == rx.src_id && dup->msg_id == rx.msg_id &&
-                (now - dup->accepted_at) < pdMS_TO_TICKS(15000)) {
+                (now - dup->accepted_at) < pdMS_TO_TICKS(GTW_LORA_DUPLICATE_WINDOW_MS)) {
                 stats.duplicate++;
                 gtw_send_ack(&rx);
                 stats.ack_sent++;
@@ -1631,7 +1798,9 @@ void gtw_lora_rx_task(void *pvParameters) {
             bool accepted = false;
 
             if (rx.has_bomba_id == 1) {
+#if DEBUG_MODE
                 printf("Enviando PATCH para BOMBA %d (Tanque %d)\n", rx.bomba_id, rx.src_id);
+#endif
 
                 char pathBomba[40];
                 snprintf(pathBomba, sizeof(pathBomba), "/bomba/%d", rx.bomba_id);
@@ -1640,12 +1809,16 @@ void gtw_lora_rx_task(void *pvParameters) {
                 const char *patch_body = body;
                 if (gtw_expand_short_lora_body(body, rx.has_bomba_id, expanded_body, sizeof(expanded_body))) {
                     patch_body = expanded_body;
+#if DEBUG_MODE
                     ESP_LOGI(TAG, "Payload curto expandido: %s", patch_body);
+#endif
                 }
 
                 accepted = queue_patch_request(pathBomba, patch_body);
             } else if (rx.has_bomba_id == 0) {
+#if DEBUG_MODE
                 printf("Enviando PATCH para TANQUE %d\n", rx.src_id);
+#endif
 
                 char pathTanque[30];
                 snprintf(pathTanque, sizeof(pathTanque), "/tanque/%d", rx.src_id);
@@ -1654,12 +1827,16 @@ void gtw_lora_rx_task(void *pvParameters) {
                 const char *patch_body = body;
                 if (gtw_expand_short_lora_body(body, rx.has_bomba_id, expanded_body, sizeof(expanded_body))) {
                     patch_body = expanded_body;
+#if DEBUG_MODE
                     ESP_LOGI(TAG, "Payload curto expandido: %s", patch_body);
+#endif
                 }
 
                 accepted = queue_patch_request(pathTanque, patch_body);
             } else if (rx.has_bomba_id == 2) {
+#if DEBUG_MODE
                 printf("Enviando PATCH para Alertas %d\n", rx.src_id);
+#endif
 
                 char pathTanque[30];
                 snprintf(pathTanque, sizeof(pathTanque), "/alertas/tanque");
@@ -1669,7 +1846,9 @@ void gtw_lora_rx_task(void *pvParameters) {
 
                 if (gtw_expand_compact_alert_body(body, rx.src_id, expanded_alert, sizeof(expanded_alert))) {
                     alert_body = expanded_alert;
+#if DEBUG_MODE
                     ESP_LOGI(TAG, "Alerta compacto expandido: %s", alert_body);
+#endif
                 }
 
                 accepted = queue_http_request(pathTanque, alert_body, HTTP_POST);
@@ -1686,7 +1865,9 @@ void gtw_lora_rx_task(void *pvParameters) {
                 }
 
                 if (controle_id > 0) {
+#if DEBUG_MODE
                     printf("Enviando PATCH para CONTROLE BOMBA %d (Tanque %d)\n", controle_id, rx.src_id);
+#endif
 
                     char pathControle[48];
                     snprintf(pathControle, sizeof(pathControle), "/bomba/controle/%d", controle_id);
@@ -1716,7 +1897,7 @@ void gtw_lora_rx_task(void *pvParameters) {
 }
 
 static void gtw_lora_health_task(void *pvParameters) {
-    int recovery_cycles = 0;
+    int recovery_failures = 0;
     gtw_last_lora_rx_ms = esp_timer_get_time() / 1000;
 
     while (1) {
@@ -1725,37 +1906,43 @@ static void gtw_lora_health_task(void *pvParameters) {
         int64_t now_ms = esp_timer_get_time() / 1000;
         int64_t silent_ms = now_ms - gtw_last_lora_rx_ms;
 
-        if (silent_ms < 180000) {
-            recovery_cycles = 0;
+        if (gtw_lora_ready && silent_ms < GTW_LORA_SILENCE_RECOVERY_MS) {
+            recovery_failures = 0;
             continue;
         }
 
-        ESP_LOGW("LORA_HEALTH", "Sem frame LoRa válido há %lld s; reconfigurando E32", silent_ms / 1000);
+        ESP_LOGW("LORA_HEALTH", "%s; reinicializando e validando E32",
+                 gtw_lora_ready ? "Silencio LoRa prolongado" : "E32 indisponivel");
 
         if (xSemaphoreTake(gtw_request_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
             esp_err_t err = ESP_ERR_TIMEOUT;
 
             if (xSemaphoreTake(MutexLora, pdMS_TO_TICKS(5000)) == pdTRUE) {
-                err = lora_e32_apply_cfg();
+                err = lora_e32_reinit();
+                if (err == ESP_OK) {
+                    err = lora_e32_apply_cfg_temp();
+                }
                 xSemaphoreGive(MutexLora);
             }
 
             xSemaphoreGive(gtw_request_mutex);
 
-            if (err == ESP_OK)
-                ESP_LOGI("LORA_HEALTH", "E32 reconfigurado por M0/M1");
-            else
+            gtw_lora_ready = (err == ESP_OK);
+            if (gtw_lora_ready) {
+                recovery_failures = 0;
+                ESP_LOGI("LORA_HEALTH", "E32 reinicializado e configuracao confirmada");
+            } else {
+                recovery_failures++;
                 ESP_LOGE("LORA_HEALTH", "Falha ao reconfigurar E32: %s", esp_err_to_name(err));
+            }
         }
 
-        recovery_cycles++;
         gtw_last_lora_rx_ms = now_ms;
 
-        if (recovery_cycles >= 5) {
-            // Ausência de frames também pode significar tanque desligado ou fora
-            // de alcance. O gateway deve permanecer online e continuar tentando.
-            ESP_LOGE("LORA_HEALTH", "LoRa sem comunicação prolongada; gateway permanece online");
-            recovery_cycles = 0;
+        if (recovery_failures >= 5) {
+            ESP_LOGE("LORA_HEALTH", "E32 falhou em %d recuperacoes; gateway continuara tentando",
+                     recovery_failures);
+            recovery_failures = 0;
         }
     }
 }
@@ -1839,10 +2026,13 @@ void gtw_send_ack(const lora_app_frame_t *rx) {
         size_t air_len = lora_frame_air_len(&ack);
         int sent = lora_send_frame_air(&ack);
         xSemaphoreGive(MutexLora);
-        if (sent == (int)air_len)
+        if (sent == (int)air_len) {
+#if DEBUG_MODE
             ESP_LOGI(TAG, "ACK enviado id=%d bytes=%d", ack.msg_id, sent);
-        else
+#endif
+        } else {
             ESP_LOGE(TAG, "ACK incompleto id=%d bytes=%d/%u", ack.msg_id, sent, (unsigned)air_len);
+        }
     } else {
         ESP_LOGW(TAG, "Nao foi possivel enviar ACK id=%d", ack.msg_id);
     }
@@ -1984,7 +2174,6 @@ static void ble_config_mode_task(void *pvParameters) {
 
     ble_startup_window_active = false;
     Connectado = 0;
-    TokenOk = 0;
 
 #if (GTW_ROLE_RX_ONLY == 0)
     if (taskConnect_to_websocket != NULL || ws_client != NULL) {
@@ -2001,11 +2190,11 @@ static void ble_config_mode_task(void *pvParameters) {
     }
 #endif
 
-    if (wifi_is_active()) {
-        wifi_stop_driver();
+    if (taskConecta_WIFI != NULL) {
+        xTaskNotifyGive(taskConecta_WIFI);
     }
 
-    ESP_LOGI(TAG, "Modo configuracao BLE ativo; Wi-Fi desligado");
+    ESP_LOGI(TAG, "Modo configuracao BLE ativo; desligamento do Wi-Fi solicitado a task responsavel");
     ble_config_mode_task_handle = NULL;
     vTaskDelete(NULL);
 }
@@ -2015,6 +2204,9 @@ static void ble_startup_window_task(void *pvParameters) {
         if (!bluetooth_config_is_active()) {
             ble_startup_window_active = false;
             ESP_LOGI(TAG, "Janela BLE do boot encerrada; Wi-Fi sera iniciado pela task");
+            if (taskConecta_WIFI != NULL) {
+                xTaskNotifyGive(taskConecta_WIFI);
+            }
             break;
         }
 
@@ -2042,6 +2234,9 @@ void bt_client_disconnected_callback(void) {
     ble_config_mode_active = false;
     ble_startup_window_active = false;
     ESP_LOGI(TAG, "Saindo do modo configuracao BLE; Wi-Fi sera retomado pela task");
+    if (taskConecta_WIFI != NULL) {
+        xTaskNotifyGive(taskConecta_WIFI);
+    }
 }
 
 static void bt_send_config_snapshot(void) {
@@ -2156,17 +2351,13 @@ void bt_message_received_callback(const char *message) {
         save_PasswordGTW(JsonPassword->valuestring);
         save_idGtw(JsonUserId->valueint);
         save_idUnidadeGtw(JsonUnidade->valueint);
-        bluetooth_send_message("{\"ok\":true,\"status\":\"gtw_config_saved\"}");
+        strlcpy(userNameHTTPs, JsonUserGtw->valuestring, sizeof(userNameHTTPs));
+        strlcpy(passwordHTTPs, JsonPassword->valuestring, sizeof(passwordHTTPs));
+        ID_GATEWAY = JsonUserId->valueint;
+        DEVICE_ID = JsonUnidade->valueint;
+        bluetooth_send_message("{\"ok\":true,\"status\":\"gtw_config_saved\",\"restart_required\":true}");
 
         cJSON_Delete(jsonBluetooth); // Libera a memória alocada para o JSON
-
-#if DEBUG_MODE
-        printf("Reiniciando o dispositivo apos configurarlo ...\n");
-#endif
-
-        vTaskDelay(pdMS_TO_TICKS(1000)); // Aguardar 1 segundo antes de reiniciar
-
-        esp_restart(); // Resetar connect
         return;
     }
 
@@ -2192,20 +2383,12 @@ void bt_message_received_callback(const char *message) {
 
         save_SIIDWifi(JsonSSIDWifi->valuestring);
         save_PasswordWifi(JsonPasswordWifi->valuestring);
-        bluetooth_send_message("{\"ok\":true,\"status\":\"wifi_config_saved\"}");
+        bluetooth_send_message("{\"ok\":true,\"status\":\"wifi_config_saved\",\"restart_required\":true}");
 
         strlcpy(wifi_ssid, JsonSSIDWifi->valuestring, sizeof(wifi_ssid));
         strlcpy(wifi_password, JsonPasswordWifi->valuestring, sizeof(wifi_password));
 
         cJSON_Delete(jsonBluetooth);
-
-#if DEBUG_MODE
-        printf("Reiniciando o dispositivo apos configurarlo ...\n");
-#endif
-
-        vTaskDelay(pdMS_TO_TICKS(1000)); // Aguardar 1 segundo antes de reiniciar
-
-        ConnectRest(); // Resetar connect
         return;
     }
 
@@ -2332,18 +2515,38 @@ void save_PasswordGTW(const char *password) {
 // Função para salvar o estado ID do GTW na NVS
 void save_idGtw(int state) {
     nvs_handle_t my_handle;
-    nvs_open("idGtw", NVS_READWRITE, &my_handle);
-    nvs_set_i32(my_handle, "idGtw", state);
-    nvs_commit(my_handle);
+    esp_err_t err = nvs_open("idGtw", NVS_READWRITE, &my_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE("NVS", "Falha ao abrir idGtw para escrita: %s", esp_err_to_name(err));
+        return;
+    }
+
+    err = nvs_set_i32(my_handle, "idGtw", state);
+    if (err == ESP_OK) {
+        err = nvs_commit(my_handle);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE("NVS", "Falha ao salvar idGtw: %s", esp_err_to_name(err));
+    }
     nvs_close(my_handle);
 }
 
 // Função para salvar o ID da Unidade do GTW na NVS
 void save_idUnidadeGtw(int state) {
     nvs_handle_t my_handle;
-    nvs_open("idUnidadeGtw", NVS_READWRITE, &my_handle);
-    nvs_set_i32(my_handle, "idUnidadeGtw", state);
-    nvs_commit(my_handle);
+    esp_err_t err = nvs_open("idUnidadeGtw", NVS_READWRITE, &my_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE("NVS", "Falha ao abrir idUnidadeGtw para escrita: %s", esp_err_to_name(err));
+        return;
+    }
+
+    err = nvs_set_i32(my_handle, "idUnidadeGtw", state);
+    if (err == ESP_OK) {
+        err = nvs_commit(my_handle);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE("NVS", "Falha ao salvar idUnidadeGtw: %s", esp_err_to_name(err));
+    }
     nvs_close(my_handle);
 }
 

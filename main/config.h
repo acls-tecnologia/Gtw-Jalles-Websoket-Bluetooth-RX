@@ -46,6 +46,8 @@
 #define LORA_TRANSACTION_GUARD_MS 1500
 #define LORA_RETRY_BACKOFF_MIN_MS 2500
 #define LORA_RETRY_BACKOFF_JITTER_MS 7000
+#define GTW_LORA_DUPLICATE_WINDOW_MS (2U * 60U * 1000U)
+#define GTW_LORA_SILENCE_RECOVERY_MS (10U * 60U * 1000U)
 #define GTW_LORA_RX_TIMEOUT_MS 800
 #define GTW_TX_IDLE_RX_TIMEOUT_MS 40
 #define GTW_TX_IDLE_RX_SLEEP_MS 120
@@ -53,6 +55,7 @@
 
 extern int DEVICE_ID;
 
+// 1 = teste com logs detalhados; 0 = producao com logs essenciais
 #define DEBUG_MODE 1
 
 #define Get_Estacao_Rota "/estacao/leitura/"
@@ -75,10 +78,12 @@ extern int DEVICE_ID;
 #define WS_MSG_MAX_LEN 512
 #define WS_QUEUE_LEN 20
 
-#define WIFI_INTERNET_MAX_FAILS 5
-#define WIFI_CONNECT_MAX_FAILS 5
+#define WIFI_CONNECT_MAX_FAILS 15
 #define WIFI_CYCLE_MAX_RETRIES 5
-#define WIFI_OFF_DELAY_MS 10000
+#define WIFI_IP_MAX_FAILS 12
+#define WIFI_MONITOR_INTERVAL_MS 5000U
+#define WIFI_DRIVER_RESTART_DELAY_MS 3000U
+#define WIFI_INTERNET_RESTART_DELAY_MS (30U * 60U * 1000U)
 
 #define LORA_PREAMBLE 0xAA
 
@@ -185,8 +190,8 @@ extern int ID_GATEWAY;
 
 extern int bleOFF;
 
-extern char userNameHTTPs[30];
-extern char passwordHTTPs[25];
+extern char userNameHTTPs[64];
+extern char passwordHTTPs[65];
 
 extern bool wifi_secundario;
 extern bool usando_secundario;
@@ -195,8 +200,8 @@ extern bool PressaoBomba;
 
 extern int wifi_secundario_ativo;
 
-extern char wifi_ssid[30];
-extern char wifi_password[25];
+extern char wifi_ssid[33];
+extern char wifi_password[65];
 
 extern int TokenOk;
 

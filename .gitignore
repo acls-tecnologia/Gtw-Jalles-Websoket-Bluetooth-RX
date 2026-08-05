@@ -1,0 +1,89 @@
+# ================================
+# ESP-IDF
+# ================================
+
+# Build directory
+build/
+
+# ESP-IDF generated files
+sdkconfig.old
+sdkconfig.defaults.old
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+
+# Ninja
+.ninja_deps
+.ninja_log
+rules.ninja
+
+# Compilation database
+compile_commands.json
+
+# ESP-IDF managed components
+managed_components/
+
+# Component dependencies
+dependencies.lock
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Python virtual environment
+.venv/
+venv/
+env/
+
+# ESP-IDF Python environment
+.espressif/
+
+# Logs
+*.log
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# IDE / Editor
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/launch.json
+!.vscode/tasks.json
+
+.idea/
+*.iml
+
+# Visual Studio
+.vs/
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+
+# ESP-IDF binaries / firmware generated files
+*.bin
+*.elf
+*.map
+*.hex
+
+# Partition table generated files
+partition_table/
+
+# Bootloader generated files
+bootloader/
+
+# Core dumps
+core_dump/
+
+# Flash encryption / secure boot generated files
+*.pem
+*.key

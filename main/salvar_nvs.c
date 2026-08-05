@@ -28,24 +28,26 @@ void nvs_salvar_float(char *float_key, float valor)
 float nvs_resgatar_float(char *key)
 {
     nvs_handle_t nvs_handle;
-    char Valor_str[25];
+    char Valor_str[25] = {0};
     size_t tamanho_valor_str = sizeof(Valor_str);
-    float valor_f;
+    float valor_f = -1.0f;
 
-    ESP_ERROR_CHECK(nvs_open("armazenamento", NVS_READWRITE, &nvs_handle));
-
-    esp_err_t ret = nvs_get_str(nvs_handle, key, Valor_str, &tamanho_valor_str);
-
-    sscanf(Valor_str, "%f", &valor_f);
-
-    if (ret == ESP_ERR_NVS_NOT_FOUND)
-    {
-        valor_f = -1; // Valor padrão
-        ESP_LOGE("nvs_resgatar_float", "Valor não encontrado, retornando valor padrão = %f\n", valor_f);
+    esp_err_t ret = nvs_open("armazenamento", NVS_READONLY, &nvs_handle);
+    if (ret != ESP_OK) {
+        if (ret != ESP_ERR_NVS_NOT_FOUND) {
+            ESP_LOGE("nvs_resgatar_float", "Falha ao abrir NVS: %s", esp_err_to_name(ret));
+        }
+        return valor_f;
     }
-    else
-    {
-        ESP_ERROR_CHECK(ret);
+
+    ret = nvs_get_str(nvs_handle, key, Valor_str, &tamanho_valor_str);
+    if (ret == ESP_OK) {
+        if (sscanf(Valor_str, "%f", &valor_f) != 1) {
+            ESP_LOGE("nvs_resgatar_float", "Valor invalido para a chave %s", key);
+            valor_f = -1.0f;
+        }
+    } else if (ret != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGE("nvs_resgatar_float", "Falha ao ler a chave %s: %s", key, esp_err_to_name(ret));
     }
 
     nvs_close(nvs_handle);
@@ -60,8 +62,19 @@ int load_idGTW(void)
 {
     nvs_handle_t my_handle;
     int32_t state = 0; // Valor padrão
-    nvs_open("idGtw", NVS_READONLY, &my_handle);
-    nvs_get_i32(my_handle, "idGtw", &state);
+    esp_err_t err = nvs_open("idGtw", NVS_READONLY, &my_handle);
+    if (err != ESP_OK) {
+        if (err != ESP_ERR_NVS_NOT_FOUND) {
+            ESP_LOGE("NVS", "Falha ao abrir idGtw: %s", esp_err_to_name(err));
+        }
+        return state;
+    }
+
+    err = nvs_get_i32(my_handle, "idGtw", &state);
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGE("NVS", "Falha ao ler idGtw: %s", esp_err_to_name(err));
+        state = 0;
+    }
     nvs_close(my_handle);
     return state;
 }
@@ -71,8 +84,19 @@ int load_idUnidadeGTW(void)
 {
     nvs_handle_t my_handle;
     int32_t state = 0; // Valor padrão
-    nvs_open("idUnidadeGtw", NVS_READONLY, &my_handle);
-    nvs_get_i32(my_handle, "idUnidadeGtw", &state);
+    esp_err_t err = nvs_open("idUnidadeGtw", NVS_READONLY, &my_handle);
+    if (err != ESP_OK) {
+        if (err != ESP_ERR_NVS_NOT_FOUND) {
+            ESP_LOGE("NVS", "Falha ao abrir idUnidadeGtw: %s", esp_err_to_name(err));
+        }
+        return state;
+    }
+
+    err = nvs_get_i32(my_handle, "idUnidadeGtw", &state);
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGE("NVS", "Falha ao ler idUnidadeGtw: %s", esp_err_to_name(err));
+        state = 0;
+    }
     nvs_close(my_handle);
     return state;
 }

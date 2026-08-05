@@ -58,8 +58,8 @@ int DEVICE_ID = 0;
 
 int bleOFF = 0;
 
-char userNameHTTPs[30] = {0};
-char passwordHTTPs[25] = {0};
+char userNameHTTPs[64] = {0};
+char passwordHTTPs[65] = {0};
 
 bool wifi_secundario = false;
 bool usando_secundario = false;
@@ -68,8 +68,8 @@ bool PressaoBomba = false;
 
 int wifi_secundario_ativo = 0;
 
-char wifi_ssid[30] = {0};
-char wifi_password[25] = {0};
+char wifi_ssid[33] = {0};
+char wifi_password[65] = {0};
 
 #if (GTW_ROLE_RX_ONLY == 0)
 const char *TAG_Websocket = "WEBSOCKET_CLIENT";

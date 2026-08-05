@@ -13,10 +13,10 @@ static const char *TAGLogin = "LOGIN";
 
 char token_global[700] = {0}; // Variável global para guardar o token
 int Connectado = 0;
-char full_url[256];
 
 static char *response_buffer = NULL;
 static int response_len = 0;
+static esp_http_client_handle_t request_client = NULL;
 
 // Buffer global para receber dados do GET.
 // (Ele será realocado enquanto chega resposta fração a fração.)
@@ -24,12 +24,16 @@ static char *get_response_buffer = NULL;
 static int get_response_len = 0;
 
 static void log_http_heap(const char *operacao) {
+#if DEBUG_MODE
     size_t free_heap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
     size_t min_free = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
     size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
 
     ESP_LOGI(TAGLogin, "%s heap livre=%u, minimo=%u, maior_bloco=%u", operacao, (unsigned)free_heap,
              (unsigned)min_free, (unsigned)largest);
+#else
+    (void)operacao;
+#endif
 }
 
 static void clear_get_response_buffer(void) {
@@ -38,6 +42,39 @@ static void clear_get_response_buffer(void) {
         get_response_buffer = NULL;
     }
     get_response_len = 0;
+}
+
+static esp_http_client_handle_t get_request_client(void) {
+    if (request_client != NULL) {
+        return request_client;
+    }
+
+    esp_http_client_config_t config = {
+        .url = MAIN_ROUTE,
+        .method = HTTP_METHOD_PATCH,
+        .timeout_ms = 15000,
+        .buffer_size = 2048,
+        .buffer_size_tx = 2048,
+        .transport_type = HTTP_TRANSPORT_OVER_SSL,
+        .cert_pem = rootCaCerticate,
+        .disable_auto_redirect = true,
+        .event_handler = NULL,
+        .keep_alive_enable = true,
+        .keep_alive_idle = 10,
+        .keep_alive_interval = 5,
+        .keep_alive_count = 3,
+    };
+
+    request_client = esp_http_client_init(&config);
+    if (request_client == NULL) {
+        ESP_LOGE(TAGLogin, "Erro ao inicializar cliente HTTP persistente");
+        return NULL;
+    }
+
+    esp_http_client_set_header(request_client, "Content-Type", "application/json");
+    esp_http_client_set_header(request_client, "Connection", "keep-alive");
+    esp_http_client_set_header(request_client, "Accept-Encoding", "identity");
+    return request_client;
 }
 
 bool verifica_conexao_internet() {
@@ -70,7 +107,7 @@ static esp_err_t _http_event_handler(esp_http_client_event_t *evt) {
 }
 
 bool fazer_login(const char *usuario, const char *senha) {
-    char post_data[128];
+    char post_data[256];
     snprintf(post_data, sizeof(post_data), "{\"usuario\":\"%s\",\"password\":\"%s\"}", usuario, senha);
 
     free(response_buffer);
@@ -128,7 +165,7 @@ bool fazer_login(const char *usuario, const char *senha) {
             if (access_token && cJSON_IsString(access_token) && access_token->valuestring != NULL) {
                 strncpy(token_global, access_token->valuestring, sizeof(token_global) - 1);
                 token_global[sizeof(token_global) - 1] = '\0';
-                ESP_LOGI(TAGLogin, "Token recebido e armazenado: %s", token_global);
+                ESP_LOGI(TAGLogin, "Token recebido e armazenado (%u bytes)", (unsigned)strlen(token_global));
             } else {
                 ESP_LOGW(TAG, "Campo 'access' não encontrado ou inválido.");
                 login_ok = false;
@@ -162,38 +199,27 @@ int server_request(const char *url, const char *body, http_method_t method) {
     }
 
     char tmp[256];
-    snprintf(tmp, sizeof(tmp), "%s%s", MAIN_ROUTE, url);
-
-    char *full_url = strdup(tmp);
-
-    if (!full_url) {
-        ESP_LOGE(TAGLogin, "Sem memória para full_url");
+    int url_len = snprintf(tmp, sizeof(tmp), "%s%s", MAIN_ROUTE, url);
+    if (url_len < 0 || url_len >= (int)sizeof(tmp)) {
+        ESP_LOGE(TAGLogin, "URL HTTP excedeu o buffer");
         return -1;
     }
 
-    esp_http_client_config_t config = {
-        .url = full_url,
-        .method = (method == HTTP_POST) ? HTTP_METHOD_POST : HTTP_METHOD_PATCH,
-        .timeout_ms = 15000, // Timeout de 5 segundos
-        .buffer_size = 1024,
-        // .buffer_size_tx = 2048,
-        .transport_type = HTTP_TRANSPORT_OVER_TCP,
-        .cert_pem = rootCaCerticate,
-        .disable_auto_redirect = true,
-        .event_handler = NULL,
-    };
-
-    esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_http_client_handle_t client = get_request_client();
     if (client == NULL) {
-        ESP_LOGE(TAGLogin, "Erro ao inicializar cliente HTTP.");
-        free(full_url); // ✅ evitar leak
         return -1;
     }
 
-    // Configura cabeçalhos
-    esp_http_client_set_header(client, "Content-Type", "application/json");
-    esp_http_client_set_header(client, "Connection", "close");
-    esp_http_client_set_header(client, "Accept-Encoding", "identity");
+    esp_err_t setup_err = esp_http_client_set_url(client, tmp);
+    if (setup_err == ESP_OK) {
+        setup_err =
+            esp_http_client_set_method(client, (method == HTTP_POST) ? HTTP_METHOD_POST : HTTP_METHOD_PATCH);
+    }
+    if (setup_err != ESP_OK) {
+        ESP_LOGE(TAGLogin, "Falha ao preparar cliente HTTP persistente: %s", esp_err_to_name(setup_err));
+        esp_http_client_close(client);
+        return -1;
+    }
 
     // Cabeçalho de autenticação
     char auth_header[800];
@@ -206,34 +232,38 @@ int server_request(const char *url, const char *body, http_method_t method) {
     //     esp_http_client_set_post_field(client, body, strlen(body));
     // }
 
-    if (body && strlen(body) > 0) {
-        esp_err_t s = esp_http_client_set_post_field(client, body, strlen(body));
-        if (s != ESP_OK) {
-            ESP_LOGW(TAGLogin, "set_post_field falhou: %d", s);
-            // continue mesmo assim
-        }
+    const char *request_body = body ? body : "";
+    esp_err_t body_err = esp_http_client_set_post_field(client, request_body, strlen(request_body));
+    if (body_err != ESP_OK) {
+        ESP_LOGE(TAGLogin, "set_post_field falhou: %s", esp_err_to_name(body_err));
+        esp_http_client_close(client);
+        return -1;
     }
 
     // Executa a requisição
     log_http_heap((method == HTTP_POST) ? "Antes do POST HTTPS" : "Antes do PATCH HTTPS");
     esp_err_t err = esp_http_client_perform(client);
+
+    if (err == ESP_ERR_HTTP_WRITE_DATA) {
+        ESP_LOGW(TAGLogin, "Conexao keep-alive fechada; repetindo %s com uma conexao nova",
+                 (method == HTTP_POST) ? "POST" : "PATCH");
+        esp_http_client_close(client);
+        err = esp_http_client_perform(client);
+    }
+
     if (err != ESP_OK) {
         ESP_LOGE(TAGLogin, "Erro na requisição: %s", esp_err_to_name(err));
         log_http_heap((method == HTTP_POST) ? "Falha no POST HTTPS" : "Falha no PATCH HTTPS");
-        esp_http_client_cleanup(client);
-        free(full_url);
+        esp_http_client_close(client);
         return -1;
     }
 
     // Obtém o código de status
     int status = esp_http_client_get_status_code(client);
+#if DEBUG_MODE
     ESP_LOGI(TAGLogin, "Requisição %s para %s retornou status: %d", (method == HTTP_POST) ? "POST" : "PATCH", url,
              status);
-
-    // Libera o cliente
-    esp_http_client_cleanup(client);
-
-    free(full_url); // ✅ libera na hora certa!
+#endif
 
     if (status == 401 || status == 403) {
         token_global[0] = '\0';
@@ -318,7 +348,7 @@ int server_get_json(const char *full_url, char **out_buffer, int *out_len) {
         .cert_pem = rootCaCerticate,
         .event_handler = _http_event_handler_get,
         .buffer_size = 1024, // internal buffer do TCP
-        .buffer_size_tx = 512,
+        .buffer_size_tx = 2048,
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
