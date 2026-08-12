@@ -1,4 +1,5 @@
 #include "config.h" //Configuração do projeto
+#include "network_mode.h"
 
 #define BLE_STARTUP_WINDOW_MS (30 * 1000U)
 #define HTTP_MUTEX_WAIT_MS 20000U
@@ -612,8 +613,10 @@ void app_main(void) {
     ESP_LOGW(TAG, "Modo RX_ONLY: WebSocket Processor desativado");
 #endif
 
-    if (xTaskCreate(vTaskImprimirUsoMemoria, "MonitorMemoria", 6144, NULL, 3, &taskImprimirUsoMemoria) != pdPASS)
+    if (xTaskCreate(vTaskImprimirUsoMemoria, "MonitorMemoria", 6144, NULL, 3, &taskImprimirUsoMemoria) != pdPASS) {
         ESP_LOGE(TAG, "Falha ao criar task Monitor de Memória");
+        ConnectRest();
+    }
 
     /****************************************
      * 7️⃣ Sistema inicializado
@@ -717,6 +720,17 @@ void wifi_task(void *pv) {
             falhas_ip = 0;
             ciclos_religar = 0;
 
+            // O login/API deve continuar tentando sempre que houver Wi-Fi e IP valido,
+            // mesmo se o diagnostico externo do Google estiver temporariamente indisponivel.
+            if (Task_login_task == NULL) {
+                if (xTaskCreate(login_task, "login_task", 1024 * 8, NULL, 5, &Task_login_task) != pdPASS) {
+                    Task_login_task = NULL;
+                    ESP_LOGE(TAG, "Falha ao criar login_task; nova tentativa no proximo ciclo");
+                } else {
+                    ESP_LOGI(TAG, "Task de login criada; aguardando resposta da API");
+                }
+            }
+
             if (wifi_check_internet(INTERNET_CHECK_TIMEOUT_MS)) {
                 falhas_internet = 0;
                 inicio_falha_internet_ms = 0;
@@ -724,17 +738,7 @@ void wifi_task(void *pv) {
                 ESP_LOGI(TAG, "Conectado e com internet!");
 #endif
 
-                if (Connectado == 0) {
-                    Connectado = 1;
-
-                    if (Task_login_task == NULL) {
-                        if (xTaskCreate(login_task, "login_task", 1024 * 8, NULL, 5, &Task_login_task) != pdPASS) {
-                            Task_login_task = NULL;
-                            Connectado = 0;
-                            ESP_LOGE(TAG, "Falha ao criar login_task; nova tentativa no proximo ciclo");
-                        }
-                    }
-                }
+                Connectado = 1;
 
                 if (wifi_secundario) {
                     if (TokenOk == 1 && wifi_secundario_ativo == 1 && wifi_4G == 0) {
@@ -753,7 +757,7 @@ void wifi_task(void *pv) {
                          (unsigned long)(sem_internet_ms / 1000U), falhas_internet);
 
                 if (sem_internet_ms >= WIFI_INTERNET_RESTART_DELAY_MS) {
-                    ESP_LOGW(TAG, "Sem internet por 30 minutos; reiniciando somente o driver Wi-Fi");
+                    ESP_LOGW(TAG, "Sem internet por 5 minutos; reiniciando somente o driver Wi-Fi");
                     falhas_internet = 0;
                     inicio_falha_internet_ms = 0;
 
@@ -858,9 +862,9 @@ void login_task(void *pvParameters) {
 
         TokenOk = token_global[0] != '\0';
 
-        if (verifica_conexao_internet()) {
-            if (Connectado == 0) {
-                Connectado = 1;
+        if (wifi_sta_connected() && wifi_sta_has_ip()) {
+            if (!verifica_conexao_internet()) {
+                ESP_LOGW(TAG, "Diagnostico Google/DNS falhou; tentando a API diretamente");
             }
 
             bool login_ok = false;
@@ -958,9 +962,11 @@ void login_task(void *pvParameters) {
 void connect_to_websocket(void *pvParameters) {
 
     static char tmp[900];
+    static char ws_path[800];
     stop_websocket_task = false;
 
-    snprintf(tmp, sizeof(tmp), "wss://jalles.aclsconnect.com/ws-native/native-ws?token=%s", token_global);
+    snprintf(ws_path, sizeof(ws_path), "/ws-native/native-ws?token=%s", token_global);
+    snprintf(tmp, sizeof(tmp), "wss://jalles.aclsconnect.com%s", ws_path);
     // snprintf(tmp, sizeof(tmp),
     // "wss://83cd1aa837661fab941b2c5a2a65424b.jm.net.br:2087/ws-native/native-ws?token=%s",token_global); snprintf(tmp,
     // sizeof(tmp), "ws://192.168.1.111:8017/native-ws?token=%s", token_global);
@@ -974,9 +980,21 @@ void connect_to_websocket(void *pvParameters) {
         return;
     }
 
+    gtw_websocket_transport_t network_transport = {0};
+    esp_err_t transport_err = gtw_websocket_transport_init(&network_transport, ws_path, rootCaCerticate);
+    if (transport_err != ESP_OK) {
+        ESP_LOGE(TAG, "Falha ao preparar transporte WebSocket %s: %s", GTW_IP_VERSION_NAME,
+                 esp_err_to_name(transport_err));
+        free(websocket_url);
+        websocket_url = NULL;
+        taskConnect_to_websocket = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
     esp_websocket_client_config_t websocket_cfg = {
         .uri = websocket_url,
-        .cert_pem = rootCaCerticate,
+        .ext_transport = network_transport.websocket,
         .reconnect_timeout_ms = 5000,
         .network_timeout_ms = 30000,
         // .keep_alive_enable = true,
@@ -995,6 +1013,7 @@ void connect_to_websocket(void *pvParameters) {
             free(websocket_url);
             websocket_url = NULL;
         }
+        gtw_websocket_transport_cleanup(&network_transport);
         taskConnect_to_websocket = NULL;
         vTaskDelete(NULL);
         return;
@@ -1005,6 +1024,7 @@ void connect_to_websocket(void *pvParameters) {
     if (esp_websocket_client_start(ws_client) != ESP_OK) {
         ESP_LOGE(TAG, "Erro ao iniciar o cliente WebSocket");
         esp_websocket_client_destroy(ws_client);
+        gtw_websocket_transport_cleanup(&network_transport);
         ws_client = NULL;
         if (websocket_url) {
             free(websocket_url);
@@ -1038,6 +1058,7 @@ void connect_to_websocket(void *pvParameters) {
     esp_websocket_client_stop(ws_client);
     esp_websocket_client_destroy(ws_client);
     ws_client = NULL;
+    gtw_websocket_transport_cleanup(&network_transport);
 
     if (websocket_url) {
         free(websocket_url);

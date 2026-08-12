@@ -7,6 +7,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if GTW_USE_IPV6
+#define GTW_HTTP_ADDR_TYPE HTTP_ADDR_TYPE_INET6
+#define GTW_SOCKET_ADDR_FAMILY AF_INET6
+#else
+#define GTW_HTTP_ADDR_TYPE HTTP_ADDR_TYPE_INET
+#define GTW_SOCKET_ADDR_FAMILY AF_INET
+#endif
+
 // TAG para logs
 static const char *TAG_GET = "HTTP_GET_JSON";
 static const char *TAGLogin = "LOGIN";
@@ -56,6 +64,7 @@ static esp_http_client_handle_t get_request_client(void) {
         .buffer_size = 2048,
         .buffer_size_tx = 2048,
         .transport_type = HTTP_TRANSPORT_OVER_SSL,
+        .addr_type = GTW_HTTP_ADDR_TYPE,
         .cert_pem = rootCaCerticate,
         .disable_auto_redirect = true,
         .event_handler = NULL,
@@ -78,8 +87,12 @@ static esp_http_client_handle_t get_request_client(void) {
 }
 
 bool verifica_conexao_internet() {
-    struct addrinfo *res;
-    int err = getaddrinfo("www.google.com", NULL, NULL, &res);
+    struct addrinfo hints = {
+        .ai_family = GTW_SOCKET_ADDR_FAMILY,
+        .ai_socktype = SOCK_STREAM,
+    };
+    struct addrinfo *res = NULL;
+    int err = getaddrinfo("www.google.com", NULL, &hints, &res);
     if (err == 0 && res != NULL) {
         freeaddrinfo(res);
         return true;
@@ -123,6 +136,7 @@ bool fazer_login(const char *usuario, const char *senha) {
         .buffer_size = 4096,
         .cert_pem = rootCaCerticate,
         .transport_type = HTTP_TRANSPORT_OVER_TCP,
+        .addr_type = GTW_HTTP_ADDR_TYPE,
         .event_handler = _http_event_handler,
     };
 
@@ -344,6 +358,7 @@ int server_get_json(const char *full_url, char **out_buffer, int *out_len) {
         .method = HTTP_METHOD_GET,
         .timeout_ms = 10000, // Timeout de 2 segundos (ajuste se quiser mais)
         .transport_type = HTTP_TRANSPORT_OVER_TCP,
+        .addr_type = GTW_HTTP_ADDR_TYPE,
         .disable_auto_redirect = true,
         .cert_pem = rootCaCerticate,
         .event_handler = _http_event_handler_get,

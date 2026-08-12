@@ -1,4 +1,5 @@
 #include "wifi.h"
+#include "config.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
@@ -8,11 +9,24 @@
 #include <errno.h>
 #include <string.h>
 
+#ifdef TAG
+#undef TAG
+#endif
+
 static const char *TAG = "WiFiConnect";
 static EventGroupHandle_t wifi_event_group;
 
-static const int WIFI_CONNECTED_BIT = BIT0;
+static const int WIFI_IPV4_READY_BIT = BIT0;
 static const int WIFI_FAIL_BIT = BIT1;
+static const int WIFI_IPV6_READY_BIT = BIT2;
+
+#if GTW_USE_IPV6
+#define WIFI_SELECTED_IP_READY_BIT WIFI_IPV6_READY_BIT
+#define GTW_SOCKET_ADDR_FAMILY AF_INET6
+#else
+#define WIFI_SELECTED_IP_READY_BIT WIFI_IPV4_READY_BIT
+#define GTW_SOCKET_ADDR_FAMILY AF_INET
+#endif
 
 static bool netif_inited = false;
 static bool wifi_started = false;
@@ -21,15 +35,29 @@ static esp_netif_t *sta_netif = NULL;
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data) {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT);
+        xEventGroupClearBits(wifi_event_group, WIFI_IPV4_READY_BIT | WIFI_IPV6_READY_BIT);
         xEventGroupSetBits(wifi_event_group, WIFI_FAIL_BIT);
         ESP_LOGW(TAG, "Wi-Fi desconectado");
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_CONNECTED) {
+#if GTW_USE_IPV6
+        esp_err_t err = esp_netif_create_ip6_linklocal(sta_netif);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Falha ao iniciar IPv6 na interface Wi-Fi: %s", esp_err_to_name(err));
+        }
+#endif
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
-        xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
-        ESP_LOGI(TAG, "Wi-Fi obteve IP");
+        xEventGroupSetBits(wifi_event_group, WIFI_IPV4_READY_BIT);
+        ESP_LOGI(TAG, "Wi-Fi obteve IPv4");
+    } else if (base == IP_EVENT && id == IP_EVENT_GOT_IP6) {
+        ip_event_got_ip6_t *event = (ip_event_got_ip6_t *)data;
+        esp_ip6_addr_type_t type = esp_netif_ip6_get_addr_type(&event->ip6_info.ip);
+        ESP_LOGI(TAG, "Wi-Fi obteve IPv6: " IPV6STR " (tipo=%d)", IPV62STR(event->ip6_info.ip), type);
+        if (type == ESP_IP6_ADDR_IS_GLOBAL || type == ESP_IP6_ADDR_IS_UNIQUE_LOCAL) {
+            xEventGroupSetBits(wifi_event_group, WIFI_IPV6_READY_BIT);
+        }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_LOST_IP) {
-        xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT);
-        ESP_LOGW(TAG, "Wi-Fi perdeu o endereco IP");
+        xEventGroupClearBits(wifi_event_group, WIFI_IPV4_READY_BIT);
+        ESP_LOGW(TAG, "Wi-Fi perdeu o endereco IPv4");
     }
 }
 
@@ -105,7 +133,7 @@ bool wifi_start_driver(void) {
         return false;
     }
     wifi_started = true;
-    ESP_LOGI(TAG, "Driver Wi-Fi iniciado");
+    ESP_LOGI(TAG, "Driver Wi-Fi iniciado; conexoes configuradas para %s", GTW_IP_VERSION_NAME);
     return true;
 }
 
@@ -116,7 +144,7 @@ void wifi_stop_driver(void) {
         esp_wifi_stop();
         esp_wifi_deinit();
         wifi_started = false;
-        xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+        xEventGroupClearBits(wifi_event_group, WIFI_IPV4_READY_BIT | WIFI_IPV6_READY_BIT | WIFI_FAIL_BIT);
     }
 }
 
@@ -130,7 +158,7 @@ bool wifi_connect_credentials(const char *ssid, const char *pass, int timeout_ms
     strncpy((char *)cfg.sta.ssid, ssid, sizeof(cfg.sta.ssid) - 1);
     strncpy((char *)cfg.sta.password, pass, sizeof(cfg.sta.password) - 1);
 
-    xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+    xEventGroupClearBits(wifi_event_group, WIFI_IPV4_READY_BIT | WIFI_IPV6_READY_BIT | WIFI_FAIL_BIT);
 
     esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &cfg);
     if (err != ESP_OK) {
@@ -144,10 +172,10 @@ bool wifi_connect_credentials(const char *ssid, const char *pass, int timeout_ms
         return false;
     }
 
-    EventBits_t bits = xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE, pdFALSE,
+    EventBits_t bits = xEventGroupWaitBits(wifi_event_group, WIFI_SELECTED_IP_READY_BIT | WIFI_FAIL_BIT, pdFALSE, pdFALSE,
                                            pdMS_TO_TICKS(timeout_ms));
 
-    return (bits & WIFI_CONNECTED_BIT);
+    return (bits & WIFI_SELECTED_IP_READY_BIT);
 }
 
 bool wifi_is_active(void) { return wifi_started; }
@@ -158,13 +186,40 @@ bool wifi_sta_connected(void) {
 }
 
 bool wifi_sta_has_ip(void) {
-    return wifi_event_group && (xEventGroupGetBits(wifi_event_group) & WIFI_CONNECTED_BIT);
+    if (!wifi_started || !sta_netif || !wifi_event_group) {
+        return false;
+    }
+
+#if GTW_USE_IPV6
+    esp_ip6_addr_t addresses[CONFIG_LWIP_IPV6_NUM_ADDRESSES] = {0};
+    int address_count = esp_netif_get_all_preferred_ip6(sta_netif, addresses);
+
+    for (int i = 0; i < address_count; i++) {
+        esp_ip6_addr_type_t type = esp_netif_ip6_get_addr_type(&addresses[i]);
+        if (type == ESP_IP6_ADDR_IS_GLOBAL || type == ESP_IP6_ADDR_IS_UNIQUE_LOCAL) {
+            xEventGroupSetBits(wifi_event_group, WIFI_IPV6_READY_BIT);
+            return true;
+        }
+    }
+
+    xEventGroupClearBits(wifi_event_group, WIFI_IPV6_READY_BIT);
+    return false;
+#else
+    esp_netif_ip_info_t ip_info = {0};
+    if (esp_netif_get_ip_info(sta_netif, &ip_info) == ESP_OK && ip_info.ip.addr != 0) {
+        xEventGroupSetBits(wifi_event_group, WIFI_IPV4_READY_BIT);
+        return true;
+    }
+
+    xEventGroupClearBits(wifi_event_group, WIFI_IPV4_READY_BIT);
+    return false;
+#endif
 }
 
 bool wifi_check_internet(int timeout_ms) {
     struct addrinfo hints = {0};
     struct addrinfo *res = NULL;
-    hints.ai_family = AF_INET;
+    hints.ai_family = GTW_SOCKET_ADDR_FAMILY;
     hints.ai_socktype = SOCK_STREAM;
 
     int dns_err = getaddrinfo("www.google.com", "443", &hints, &res);

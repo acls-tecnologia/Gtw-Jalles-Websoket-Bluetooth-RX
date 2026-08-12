@@ -1,0 +1,9 @@
+# Mantem IPv4 e IPv6 compilados para permitir a selecao por GTW_USE_IPV6.
+CONFIG_LWIP_IPV4=y
+CONFIG_LWIP_IPV6=y
+CONFIG_LWIP_IPV6_AUTOCONFIG=y
+CONFIG_LWIP_IPV6_NUM_ADDRESSES=3
+
+# Aceita ate dois servidores DNS enviados pelo roteador via IPv6 RA/RDNSS.
+CONFIG_LWIP_IPV6_RDNSS_MAX_DNS_SERVERS=2
+CONFIG_LWIP_DNS_MAX_SERVERS=3
