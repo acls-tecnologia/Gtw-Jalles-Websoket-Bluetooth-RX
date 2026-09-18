@@ -87,3 +87,6 @@ core_dump/
 # Flash encryption / secure boot generated files
 *.pem
 *.key
+
+# Segredo compartilhado com o backend para as rotas OTA
+main/ota_secret.h

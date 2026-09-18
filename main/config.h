@@ -29,6 +29,7 @@
 #include "lora.h"
 #include "salvar_nvs.h"
 #include "wifi.h"
+#include "ota_secret.h"
 
 /***********************************************
  * CONSTANTES GERAIS
@@ -67,6 +68,13 @@
 #define GTW_TX_IDLE_RX_SLEEP_MS 120
 #define GTW_LORA_MUTEX_WAIT_MS 300
 
+#define OTA_FILE_ID 8
+#define OTA_METADATA_URL "https://jalles.aclsconnect.com/67ZlfPVt/files/Leitura/8"
+#define OTA_DOWNLOAD_URL "https://jalles.aclsconnect.com/67ZlfPVt/files/download/8"
+#define OTA_HTTP_TIMEOUT_MS 30000
+#define OTA_CHECK_RETRY_DELAY_MS 30000
+#define OTA_CHECK_MAX_ATTEMPTS 3
+
 extern int DEVICE_ID;
 
 // 1 = teste com logs detalhados; 0 = producao com logs essenciais
@@ -83,7 +91,6 @@ extern int DEVICE_ID;
 #define TAG_atualizacao_OTA "Atialzação OTA"
 #define TAG_HTTP_Firm_Version "HTTP_Firm_Version"
 #define TAG_Atualiza_firmware "Atualiza_firmware"
-#define NVS_KEY_Fversion "Firm_version"
 
 #define MAX_RECONNECT_ATTEMPTS 8
 #define PATH_SIZE 64
@@ -193,7 +200,6 @@ extern TaskHandle_t Task_login_task;
 extern TaskHandle_t controllerTaskHandle;
 
 /********** VARIÁVEIS GLOBAIS **********/
-extern float Firmware_version;
 extern int InternetInit_Cont;
 extern uint8_t Forca_update;
 extern int NVS_Recuperado;

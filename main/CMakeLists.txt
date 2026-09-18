@@ -5,5 +5,6 @@ idf_component_register(SRCS "salvar_nvs.c"
                             "http_request.c"
                             "network_mode.c"
                             "wifi.c"
+                            "firmware_ota.c"
                             "main.c"
                     INCLUDE_DIRS ".")

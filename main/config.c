@@ -47,7 +47,6 @@ TaskHandle_t Task_login_task = NULL;
 TaskHandle_t controllerTaskHandle = NULL;
 
 /********** VARIÁVEIS **********/
-float Firmware_version = 1.0;
 int InternetInit_Cont = 0;
 uint8_t Forca_update = 0;
 int NVS_Recuperado = 0;

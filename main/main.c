@@ -1,4 +1,5 @@
 #include "config.h" //Configuração do projeto
+#include "firmware_ota.h"
 #include "network_mode.h"
 
 #define BLE_STARTUP_WINDOW_MS (30 * 1000U)
@@ -387,11 +388,13 @@ bool ws_send_json(const char *json_msg);
 #endif
 
 void bt_message_received_callback(const char *message);
+void bt_binary_received_callback(const uint8_t *data, size_t length);
 
 void bt_client_connected_callback(void);
 void bt_client_disconnected_callback(void);
 
 static void bt_send_config_snapshot(void);
+static void ble_ota_restart_task(void *pvParameters);
 static void ble_config_mode_task(void *pvParameters);
 static void ble_startup_window_task(void *pvParameters);
 
@@ -413,6 +416,14 @@ void app_main(void) {
     if (errNVS != ESP_OK) {
         ESP_LOGE(TAG, "Erro ao inicializar NVS: %s", esp_err_to_name(errNVS));
         ConnectRest();
+    }
+
+    ESP_ERROR_CHECK(firmware_ota_init());
+
+
+    esp_err_t fw_validation_err = firmware_ota_schedule_validation(30000);
+    if (fw_validation_err != ESP_OK) {
+        ESP_LOGE(TAG, "Falha ao agendar validacao da imagem OTA: %s", esp_err_to_name(fw_validation_err));
     }
 
     /****************************************
@@ -561,13 +572,6 @@ void app_main(void) {
         }
     }
 
-    float saved_firmware_version = nvs_resgatar_float(NVS_KEY_Fversion);
-    if (saved_firmware_version > 0)
-    {
-        Firmware_version = saved_firmware_version;
-        ESP_LOGI("NVS", ">>>>>>>>>>>>>>>>>>>>>> Firmware_version : %f", Firmware_version);
-    }
-
     /****************************************
      * 5️⃣ Configuração LoRa
      ****************************************/
@@ -622,7 +626,6 @@ void app_main(void) {
      * 7️⃣ Sistema inicializado
      ****************************************/
     ESP_LOGI(TAG, "Sistema inicializado com sucesso.");
-
 }
 
 static void tentar_conectar_wifi(void) {
@@ -656,6 +659,7 @@ void wifi_task(void *pv) {
     static int ciclos_religar = 0;
     int64_t inicio_falha_internet_ms = 0;
     int wifi_4G = 0;
+    bool ota_checked_for_connection = false;
 
     while (1) {
         esp_task_wdt_reset();
@@ -667,10 +671,12 @@ void wifi_task(void *pv) {
                 wifi_stop_driver();
             }
             Connectado = 0;
+            ota_checked_for_connection = false;
             continue;
         }
 
         if (!wifi_is_active()) {
+            ota_checked_for_connection = false;
             ESP_LOGW(TAG, "Driver Wi-Fi inativo — reiniciando driver...");
             tentar_conectar_wifi();
 
@@ -693,6 +699,7 @@ void wifi_task(void *pv) {
 
             if (!wifi_sta_has_ip()) {
                 Connectado = 0;
+                ota_checked_for_connection = false;
                 falhas_internet = 0;
                 inicio_falha_internet_ms = 0;
                 falhas_ip++;
@@ -740,6 +747,16 @@ void wifi_task(void *pv) {
 
                 Connectado = 1;
 
+                if (!ota_checked_for_connection) {
+                    esp_err_t ota_err = firmware_ota_check_for_update_async();
+                    if (ota_err == ESP_OK) {
+                        ota_checked_for_connection = true;
+                        ESP_LOGI(TAG, "Verificacao OTA do arquivo %d agendada", OTA_FILE_ID);
+                    } else {
+                        ESP_LOGW(TAG, "Nao foi possivel agendar verificacao OTA: %s", esp_err_to_name(ota_err));
+                    }
+                }
+
                 if (wifi_secundario) {
                     if (TokenOk == 1 && wifi_secundario_ativo == 1 && wifi_4G == 0) {
                         wifi_4G = 1;
@@ -747,6 +764,7 @@ void wifi_task(void *pv) {
                 }
             } else {
                 Connectado = 0;
+                ota_checked_for_connection = false;
                 falhas_internet++;
                 int64_t agora_ms = esp_timer_get_time() / 1000;
                 if (inicio_falha_internet_ms == 0)
@@ -777,6 +795,7 @@ void wifi_task(void *pv) {
         } else {
             // Não conectado ao AP
             Connectado = 0;
+            ota_checked_for_connection = false;
             falhas_ip = 0;
             falhas_internet = 0;
             inicio_falha_internet_ms = 0;
@@ -1754,8 +1773,7 @@ void gtw_lora_rx_task(void *pvParameters) {
             TaskHandle_t waiter = NULL;
 
             xSemaphoreTake(gtw_ack_mutex, portMAX_DELAY);
-            if (gtw_ack_wait.active && gtw_ack_wait.msg_id == rx.msg_id &&
-                gtw_ack_wait.tank_id == rx.src_id) {
+            if (gtw_ack_wait.active && gtw_ack_wait.msg_id == rx.msg_id && gtw_ack_wait.tank_id == rx.src_id) {
                 waiter = gtw_ack_wait.waiter;
                 gtw_ack_wait.active = false;
                 gtw_ack_wait.accept_any_frame = false;
@@ -1961,8 +1979,7 @@ static void gtw_lora_health_task(void *pvParameters) {
         gtw_last_lora_rx_ms = now_ms;
 
         if (recovery_failures >= 5) {
-            ESP_LOGE("LORA_HEALTH", "E32 falhou em %d recuperacoes; gateway continuara tentando",
-                     recovery_failures);
+            ESP_LOGE("LORA_HEALTH", "E32 falhou em %d recuperacoes; gateway continuara tentando", recovery_failures);
             recovery_failures = 0;
         }
     }
@@ -2252,6 +2269,7 @@ void bt_client_connected_callback(void) {
 }
 
 void bt_client_disconnected_callback(void) {
+    firmware_ota_ble_abort();
     ble_config_mode_active = false;
     ble_startup_window_active = false;
     ESP_LOGI(TAG, "Saindo do modo configuracao BLE; Wi-Fi sera retomado pela task");
@@ -2260,32 +2278,42 @@ void bt_client_disconnected_callback(void) {
     }
 }
 
+static void ble_ota_restart_task(void *pvParameters) {
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    esp_restart();
+}
+
+void bt_binary_received_callback(const uint8_t *data, size_t length) {
+    if (!data || length <= 5 || data[0] != 0xA1) {
+        bluetooth_send_message("{\"ok\":false,\"type\":\"BleOtaError\",\"error\":\"invalid_packet\"}");
+        return;
+    }
+    uint32_t offset = (uint32_t)data[1] | ((uint32_t)data[2] << 8) | ((uint32_t)data[3] << 16) |
+                      ((uint32_t)data[4] << 24);
+    uint8_t percent = 0;
+    esp_err_t err = firmware_ota_ble_write(offset, data + 5, length - 5, &percent);
+    if (err != ESP_OK) {
+        char response[128];
+        snprintf(response, sizeof(response),
+                 "{\"ok\":false,\"type\":\"BleOtaError\",\"error\":\"%s\",\"offset\":%lu}",
+                 esp_err_to_name(err), (unsigned long)offset);
+        bluetooth_send_message(response);
+    }
+}
+
 static void bt_send_config_snapshot(void) {
     cJSON *root = cJSON_CreateObject();
-    cJSON *wifi = cJSON_CreateObject();
-    cJSON *gateway = cJSON_CreateObject();
-
-    if (!root || !wifi || !gateway) {
-        cJSON_Delete(root);
-        cJSON_Delete(wifi);
-        cJSON_Delete(gateway);
+    if (!root) {
         bluetooth_send_message("{\"ok\":false,\"error\":\"no_mem\"}");
         return;
     }
 
     cJSON_AddBoolToObject(root, "ok", true);
-    cJSON_AddStringToObject(root, "type", "Config");
-
-    cJSON_AddStringToObject(wifi, "SSID", wifi_ssid);
-    cJSON_AddStringToObject(wifi, "password", wifi_password);
-    cJSON_AddItemToObject(root, "wifi", wifi);
-
-    cJSON_AddStringToObject(gateway, "UserGtw", userNameHTTPs);
-    cJSON_AddStringToObject(gateway, "password", passwordHTTPs);
-    cJSON_AddNumberToObject(gateway, "IdUser", ID_GATEWAY);
-    cJSON_AddNumberToObject(gateway, "unidade", DEVICE_ID);
-    cJSON_AddItemToObject(root, "gateway", gateway);
-
+    cJSON_AddStringToObject(root, "type", "ConfigDevice");
+    cJSON_AddStringToObject(root, "device_role", GTW_ROLE_NAME);
+    cJSON_AddNumberToObject(root, "ota_file_id", OTA_FILE_ID);
+    cJSON_AddNumberToObject(root, "ota_protocol", 1);
+    cJSON_AddStringToObject(root, "firmware_version", firmware_ota_current_version());
     char *response = cJSON_PrintUnformatted(root);
     if (response) {
         bluetooth_send_message(response);
@@ -2293,7 +2321,54 @@ static void bt_send_config_snapshot(void) {
     } else {
         bluetooth_send_message("{\"ok\":false,\"error\":\"json_print\"}");
     }
+    cJSON_Delete(root);
+    vTaskDelay(pdMS_TO_TICKS(40));
 
+    root = cJSON_CreateObject();
+    cJSON *wifi = cJSON_CreateObject();
+    if (!root || !wifi) {
+        cJSON_Delete(root);
+        cJSON_Delete(wifi);
+        bluetooth_send_message("{\"ok\":false,\"error\":\"no_mem\"}");
+        return;
+    }
+    cJSON_AddBoolToObject(root, "ok", true);
+    cJSON_AddStringToObject(root, "type", "ConfigWifi");
+    cJSON_AddStringToObject(wifi, "SSID", wifi_ssid);
+    cJSON_AddStringToObject(wifi, "password", wifi_password);
+    cJSON_AddItemToObject(root, "wifi", wifi);
+    response = cJSON_PrintUnformatted(root);
+    if (response) {
+        bluetooth_send_message(response);
+        cJSON_free(response);
+    } else {
+        bluetooth_send_message("{\"ok\":false,\"error\":\"json_print\"}");
+    }
+    cJSON_Delete(root);
+    vTaskDelay(pdMS_TO_TICKS(40));
+
+    root = cJSON_CreateObject();
+    cJSON *gateway = cJSON_CreateObject();
+    if (!root || !gateway) {
+        cJSON_Delete(root);
+        cJSON_Delete(gateway);
+        bluetooth_send_message("{\"ok\":false,\"error\":\"no_mem\"}");
+        return;
+    }
+    cJSON_AddBoolToObject(root, "ok", true);
+    cJSON_AddStringToObject(root, "type", "ConfigGateway");
+    cJSON_AddStringToObject(gateway, "UserGtw", userNameHTTPs);
+    cJSON_AddStringToObject(gateway, "password", passwordHTTPs);
+    cJSON_AddNumberToObject(gateway, "IdUser", ID_GATEWAY);
+    cJSON_AddNumberToObject(gateway, "unidade", DEVICE_ID);
+    cJSON_AddItemToObject(root, "gateway", gateway);
+    response = cJSON_PrintUnformatted(root);
+    if (response) {
+        bluetooth_send_message(response);
+        cJSON_free(response);
+    } else {
+        bluetooth_send_message("{\"ok\":false,\"error\":\"json_print\"}");
+    }
     cJSON_Delete(root);
 }
 
@@ -2323,6 +2398,55 @@ void bt_message_received_callback(const char *message) {
 
     if (cmd && strcmp(cmd, "GetConfig") == 0) {
         bt_send_config_snapshot();
+        cJSON_Delete(jsonBluetooth);
+        return;
+    }
+
+    if (cmd && strcmp(cmd, "BleOtaBegin") == 0) {
+        cJSON *size_item = cJSON_GetObjectItem(jsonBluetooth, "size");
+        if (!cJSON_IsNumber(size_item) || size_item->valuedouble <= 0 ||
+            size_item->valuedouble > (double)UINT32_MAX ||
+            size_item->valuedouble != (double)(uint32_t)size_item->valuedouble) {
+            bluetooth_send_message("{\"ok\":false,\"type\":\"BleOtaError\",\"error\":\"invalid_size\"}");
+            cJSON_Delete(jsonBluetooth);
+            return;
+        }
+        esp_err_t err = firmware_ota_ble_begin((uint32_t)size_item->valuedouble);
+        if (err == ESP_OK) {
+            bluetooth_send_message("{\"ok\":true,\"type\":\"BleOtaReady\",\"offset\":0}");
+        } else {
+            char response[112];
+            snprintf(response, sizeof(response),
+                     "{\"ok\":false,\"type\":\"BleOtaError\",\"error\":\"%s\"}", esp_err_to_name(err));
+            bluetooth_send_message(response);
+        }
+        cJSON_Delete(jsonBluetooth);
+        return;
+    }
+
+    if (cmd && strcmp(cmd, "BleOtaFinish") == 0) {
+        char version[FW_VERSION_TEXT_MAX] = {0};
+        esp_err_t err = firmware_ota_ble_finish(version, sizeof(version));
+        if (err == ESP_OK) {
+            char response[128];
+            snprintf(response, sizeof(response),
+                     "{\"ok\":true,\"type\":\"BleOtaComplete\",\"version\":\"%s\",\"restarting\":true}",
+                     version);
+            bluetooth_send_message(response);
+            xTaskCreate(ble_ota_restart_task, "ble_ota_rst", 2048, NULL, 7, NULL);
+        } else {
+            char response[112];
+            snprintf(response, sizeof(response),
+                     "{\"ok\":false,\"type\":\"BleOtaError\",\"error\":\"%s\"}", esp_err_to_name(err));
+            bluetooth_send_message(response);
+        }
+        cJSON_Delete(jsonBluetooth);
+        return;
+    }
+
+    if (cmd && strcmp(cmd, "BleOtaCancel") == 0) {
+        firmware_ota_ble_abort();
+        bluetooth_send_message("{\"ok\":true,\"type\":\"BleOtaCancelled\"}");
         cJSON_Delete(jsonBluetooth);
         return;
     }

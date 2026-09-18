@@ -30,6 +30,9 @@ void bluetooth_send_message(const char *message);
 // Implementado no main.c: processa o JSON recebido via BLE.
 void bt_message_received_callback(const char *message);
 
+// Implementado no main.c: processa um pacote binario OTA recebido via BLE.
+void bt_binary_received_callback(const uint8_t *data, size_t length);
+
 // Implementados no main.c: alternam o gateway para modo configuracao BLE.
 void bt_client_connected_callback(void);
 void bt_client_disconnected_callback(void);

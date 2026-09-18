@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -24,14 +25,15 @@
 #define BLE_DEVICE_NAME "GTW-Jalles-BLE"
 #define BLE_DEFAULT_WINDOW_MS (60 * 1000)
 #define BLE_RX_MAX_LEN 512
-#define BLE_QUEUE_LEN 4
+#define BLE_QUEUE_LEN 16
 
 #define GTW_BLE_SERVICE_UUID 0xFFF0
 #define GTW_BLE_RX_UUID 0xFFF1
 #define GTW_BLE_TX_UUID 0xFFF2
 
 typedef struct {
-    char data[BLE_RX_MAX_LEN + 1];
+    uint8_t data[BLE_RX_MAX_LEN + 1];
+    uint16_t length;
 } ble_rx_msg_t;
 
 static uint8_t own_addr_type;
@@ -84,7 +86,8 @@ static void ble_rx_task(void *arg)
 
     while (1) {
         if (xQueueReceive(ble_rx_queue, &msg, portMAX_DELAY) == pdTRUE) {
-            bt_message_received_callback(msg.data);
+            msg.data[msg.length] = '\0';
+            bt_message_received_callback((const char *)msg.data);
         }
     }
 }
@@ -205,6 +208,13 @@ static int gatt_access_cb(uint16_t conn_handle, uint16_t attr_handle,
             return BLE_ATT_ERR_UNLIKELY;
         }
         msg.data[len] = '\0';
+        msg.length = len;
+
+        // Confirma o write BLE somente depois que o bloco foi gravado no flash.
+        if (msg.data[0] == 0xA1) {
+            bt_binary_received_callback(msg.data, msg.length);
+            return 0;
+        }
 
         if (xQueueSend(ble_rx_queue, &msg, 0) != pdTRUE) {
             set_status("{\"ok\":false,\"error\":\"queue_full\"}");

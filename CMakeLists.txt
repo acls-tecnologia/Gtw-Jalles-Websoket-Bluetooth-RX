@@ -3,4 +3,13 @@
 cmake_minimum_required(VERSION 3.16)
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+
+# Altere somente version.txt a cada release.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/version.txt")
+file(STRINGS "${CMAKE_CURRENT_LIST_DIR}/version.txt" PROJECT_VER LIMIT_COUNT 1)
+string(STRIP "${PROJECT_VER}" PROJECT_VER)
+if(PROJECT_VER STREQUAL "")
+    message(FATAL_ERROR "version.txt nao pode estar vazio")
+endif()
+
 project(Gtw-Jalles-Websoket-Bluetooth-RX)

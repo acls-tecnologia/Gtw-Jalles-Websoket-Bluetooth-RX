@@ -7,3 +7,9 @@ CONFIG_LWIP_IPV6_NUM_ADDRESSES=3
 # Aceita ate dois servidores DNS enviados pelo roteador via IPv6 RA/RDNSS.
 CONFIG_LWIP_IPV6_RDNSS_MAX_DNS_SERVERS=2
 CONFIG_LWIP_DNS_MAX_SERVERS=3
+
+# Mantem duas imagens OTA e permite voltar automaticamente se a nova falhar no boot.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# Aumenta o payload BLE para acelerar a transferencia de firmware via aplicativo.
+CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=512
