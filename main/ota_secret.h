@@ -1,0 +1,3 @@
+#pragma once
+
+#define OTA_ACCESS_KEY "c634303b8c5899c7d6b9d8bd38b50a08880550e9e61f7769dbd7b9bdffb71895"
